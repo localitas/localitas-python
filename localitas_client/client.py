@@ -3,9 +3,24 @@
 import json
 import time
 import urllib.parse
+from pathlib import Path
 from typing import Any, Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+
+
+def default_token() -> str:
+    """Read the API token from ~/.localitas/config-core.yaml (core.auth.api_token).
+    Returns empty string if not found."""
+    config_path = Path.home() / ".localitas" / "config-core.yaml"
+    if config_path.exists():
+        for line in config_path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("api_token:"):
+                val = stripped.removeprefix("api_token:").strip().strip("\"'")
+                if val.startswith("lt_"):
+                    return val
+    return ""
 
 
 class APIError(Exception):
