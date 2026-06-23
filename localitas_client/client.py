@@ -229,13 +229,54 @@ def _esc(s: str) -> str:
 
 class CacheRef:
     """Reference to a named cache. Provides Redis-like key-value operations
-    and typed data structure accessors (list, set, hash, sorted set, queue,
-    stack, pubsub).
+    and typed data structure accessors.
 
-    Usage:
+    Example::
+
+        client = LocalitasClient("http://localhost:8090").with_token(token)
         cache = client.cache("sessions")
+
+        # Key-value with TTL (30 min)
         cache.set("user:abc", '{"name":"Alice"}', ttl=1800)
-        val = cache.get("user:abc")
+        val = cache.get("user:abc")  # '{"name":"Alice"}'
+        cache.delete("user:abc")
+
+        # Rate limiting (atomic incr + TTL on first call)
+        count = cache.incr_with_ttl("rate:ip:1.2.3.4", delta=1, ttl=60)
+        if count > 100:
+            raise Exception("rate limited")
+
+        # Distributed lock
+        acquired = cache.set_nx("lock:resource", "owner-1", ttl=30)
+
+        # Data structures
+        recent = cache.list("recent_searches")
+        recent.rpush("golang", "sqlite")
+        recent.range(0, 9)  # last 10
+
+        tags = cache.set_store("article:tags")
+        tags.add("python", "go", "rust")
+
+        user = cache.hash("user:123")
+        user.set({"name": "Alice", "email": "alice@example.com"})
+        user.to_json()  # '{"email":"alice@...","name":"Alice"}'
+
+        lb = cache.sorted_set("leaderboard")
+        lb.add(("alice", 1500), ("bob", 2100))
+        lb.range(-10, -1)  # top 10
+
+        jobs = cache.queue("bg_jobs", max_size=1000)
+        jobs.enqueue('{"type":"email"}')
+        job = jobs.dequeue()  # oldest first
+
+        undo = cache.stack("undo", max_size=50)
+        undo.push('{"action":"delete"}')
+        action = undo.pop()  # newest first
+
+        # Durable PubSub (bounded, auto-expires after 2 weeks)
+        ch = cache.pubsub("notifications", max_size=1000, max_age_seconds=1209600)
+        ch.publish('{"type":"user.signup"}')
+        msgs = ch.read("audit-service", count=50)
     """
 
     def __init__(self, client: LocalitasClient, name: str):
@@ -330,7 +371,17 @@ class CacheRef:
 
 
 class ListRef:
-    """Double-headed deque (list). Push/pop from both ends."""
+    """Double-headed deque. Push/pop from both ends.
+
+    Example::
+
+        recent = cache.list("recent_searches")
+        recent.rpush("golang", "sqlite", "raft")  # append to tail
+        recent.lpush("newest")                     # prepend to head
+        recent.range(0, -1)   # ["newest", "golang", "sqlite", "raft"]
+        recent.lpop()         # "newest" (from head)
+        recent.rpop()         # "raft" (from tail)
+    """
 
     def __init__(self, cache: CacheRef, name: str):
         self._cache = cache
@@ -376,7 +427,15 @@ class ListRef:
 
 
 class SetRef:
-    """Unique unordered set."""
+    """Unique unordered set. Duplicates silently ignored.
+
+    Example::
+
+        tags = cache.set_store("article:123:tags")
+        tags.add("go", "rust", "python", "go")  # 3 added (go deduped)
+        tags.members()  # ["go", "python", "rust"] (sorted)
+        tags.rem("rust")
+    """
 
     def __init__(self, cache: CacheRef, name: str):
         self._cache = cache
@@ -403,7 +462,17 @@ class SetRef:
 
 
 class HashRef:
-    """Field→value map. Store structured data without JSON overhead."""
+    """Field→value map. Store structured data without JSON serialization.
+
+    Example::
+
+        user = cache.hash("user:123")
+        user.set({"name": "Alice", "email": "alice@example.com", "role": "admin"})
+        user.get("name")     # "Alice"
+        user.get_all()       # {"email": "alice@...", "name": "Alice", "role": "admin"}
+        user.to_json()       # '{"email":"alice@...","name":"Alice","role":"admin"}'
+        user.from_json('{"city": "NYC"}')  # adds/updates fields from JSON
+    """
 
     def __init__(self, cache: CacheRef, name: str):
         self._cache = cache
@@ -442,7 +511,18 @@ class HashRef:
 
 
 class SortedSetRef:
-    """Members ordered by score. For leaderboards and priority queues."""
+    """Members ordered by score. For leaderboards and priority queues.
+
+    Example::
+
+        lb = cache.sorted_set("leaderboard")
+        lb.add(("alice", 1500), ("bob", 2100), ("charlie", 1800))
+        lb.range(0, -1)           # all, lowest score first
+        lb.range(-3, -1)          # top 3
+        lb.rank("bob")            # 2 (0-based, lowest=0)
+        lb.score("alice")         # 1500.0
+        lb.incr_by("alice", 300)  # 1800.0
+    """
 
     def __init__(self, cache: CacheRef, name: str):
         self._cache = cache
@@ -492,7 +572,16 @@ class SortedSetRef:
 
 
 class QueueRef:
-    """FIFO queue. Bounded queues drop oldest on overflow."""
+    """FIFO queue. Bounded queues (max_size > 0) drop oldest on overflow.
+
+    Example::
+
+        jobs = cache.queue("email_jobs", max_size=1000)
+        jobs.enqueue('{"to": "alice@example.com"}')
+        jobs.enqueue('{"to": "bob@example.com"}')
+        job = jobs.dequeue()  # oldest first: alice's email
+        next_job = jobs.peek()  # bob's email (not removed)
+    """
 
     def __init__(self, cache: CacheRef, name: str, max_size: int):
         self._cache = cache
@@ -527,7 +616,16 @@ class QueueRef:
 
 
 class StackRef:
-    """LIFO stack. Bounded stacks drop bottom on overflow."""
+    """LIFO stack. Bounded stacks (max_size > 0) drop bottom on overflow.
+
+    Example::
+
+        undo = cache.stack("undo_history", max_size=50)
+        undo.push('{"action": "delete", "file": "doc.txt"}')
+        undo.push('{"action": "rename", "from": "a.txt", "to": "b.txt"}')
+        last = undo.pop()   # rename action (newest)
+        top = undo.peek()   # delete action (not removed)
+    """
 
     def __init__(self, cache: CacheRef, name: str, max_size: int):
         self._cache = cache
@@ -561,7 +659,29 @@ class StackRef:
 
 
 class PubSubRef:
-    """Durable pub/sub channel with broadcast and consumer group support."""
+    """Durable pub/sub channel with broadcast and consumer group support.
+
+    Broadcast: every consumer sees every message, cursor auto-advances.
+    Consumer groups: round-robin with acknowledgment.
+
+    Example::
+
+        # Bounded channel (last 1000, expire after 2 weeks)
+        ch = cache.pubsub("notifications", max_size=1000, max_age_seconds=1209600)
+
+        # Publish
+        ch.publish('{"type": "user.signup", "user": "alice"}')
+
+        # Broadcast read (each consumer sees ALL messages)
+        msgs = ch.read("audit-service", count=50)
+
+        # Consumer group (round-robin with ack)
+        ch.create_group("email_workers")
+        msg = ch.claim("email_workers", "worker-1")
+        if msg:
+            process(msg)
+            ch.ack("email_workers", msg["seq"])
+    """
 
     def __init__(self, cache: CacheRef, channel: str, max_size: int, max_age_seconds: int):
         self._cache = cache
