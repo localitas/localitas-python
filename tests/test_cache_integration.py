@@ -281,5 +281,55 @@ class TestCachePubSub(unittest.TestCase):
         ch.ack("workers", msg["seq"])
 
 
+class TestCacheWebSocket(unittest.TestCase):
+    """WebSocket pubsub tests. Requires: pip install websocket-client"""
+
+    def setUp(self):
+        self.client = make_client()
+        self.cache_name = unique_name("ws")
+        self.client.create_cache(self.cache_name)
+
+    def tearDown(self):
+        self.client.delete_cache(self.cache_name)
+
+    def test_websocket_subscribe_and_publish(self):
+        try:
+            import websocket
+        except ImportError:
+            self.skipTest("websocket-client not installed")
+
+        ws_url = f"ws://localhost:9090/apps/cache/ws/{self.cache_name}?token={INTEG_TOKEN}"
+        ws = websocket.create_connection(ws_url, timeout=5)
+
+        connected = json.loads(ws.recv())
+        self.assertEqual(connected["type"], "connected")
+
+        ws.send(json.dumps({
+            "action": "subscribe",
+            "channel": "test-ws",
+            "consumer": "py-test",
+        }))
+        sub_resp = json.loads(ws.recv())
+        self.assertEqual(sub_resp["type"], "subscribed")
+
+        ws.send(json.dumps({
+            "action": "publish",
+            "channel": "test-ws",
+            "value": '{"hello":"from-python"}',
+        }))
+        pub_resp = json.loads(ws.recv())
+        self.assertEqual(pub_resp["type"], "published")
+
+        msg = json.loads(ws.recv())
+        self.assertEqual(msg["type"], "message")
+        self.assertEqual(msg["value"], '{"hello":"from-python"}')
+
+        ws.send(json.dumps({"action": "unsubscribe", "channel": "test-ws"}))
+        unsub = json.loads(ws.recv())
+        self.assertEqual(unsub["type"], "unsubscribed")
+
+        ws.close()
+
+
 if __name__ == "__main__":
     unittest.main()
