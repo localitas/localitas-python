@@ -174,6 +174,31 @@ class LocalitasClient:
     def vault_get_secrets(self, public_id: str) -> dict[str, str]:
         return self._do("GET", f"/apps/vault/api/credentials/{_esc(public_id)}/secrets")
 
+    # ── Cache ──────────────────────────────────────────────────
+
+    def create_cache(self, name: str) -> None:
+        """Create a named in-memory cache."""
+        self._do("POST", "/apps/cache/api/caches", {"name": name})
+
+    def list_caches(self) -> list[dict]:
+        """List all named caches."""
+        result = self._do("GET", "/apps/cache/api/caches")
+        return result.get("caches", [])
+
+    def delete_cache(self, name: str) -> None:
+        """Delete a named cache. Cannot delete 'public_paths'."""
+        self._do("DELETE", f"/apps/cache/api/caches/{_esc(name)}")
+
+    def cache(self, name: str) -> "CacheRef":
+        """Return a CacheRef for key-value and data structure operations.
+
+        Usage:
+            sessions = client.cache("sessions")
+            sessions.set("user:abc", '{"name":"Alice"}', ttl=1800)
+            val = sessions.get("user:abc")
+        """
+        return CacheRef(self, name)
+
     # ── Transport ──────────────────────────────────────────────
 
     def _do(self, method: str, path: str, body: Any = None) -> Any:
@@ -200,3 +225,383 @@ class LocalitasClient:
 
 def _esc(s: str) -> str:
     return urllib.parse.quote(str(s), safe="")
+
+
+class CacheRef:
+    """Reference to a named cache. Provides Redis-like key-value operations
+    and typed data structure accessors (list, set, hash, sorted set, queue,
+    stack, pubsub).
+
+    Usage:
+        cache = client.cache("sessions")
+        cache.set("user:abc", '{"name":"Alice"}', ttl=1800)
+        val = cache.get("user:abc")
+    """
+
+    def __init__(self, client: LocalitasClient, name: str):
+        self._client = client
+        self._name = name
+        self._base = f"/apps/cache/api/caches/{_esc(name)}"
+
+    # ── KV ─────────────────────────────────────────────────────
+
+    def get(self, key: str) -> Optional[str]:
+        """Get a key's value. Returns None on miss."""
+        try:
+            result = self._client._do("GET", f"{self._base}/keys/{key}")
+            return result.get("result", {}).get("value")
+        except APIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
+    def set(self, key: str, value: str, ttl: int = 0) -> None:
+        """Set a key with optional TTL in seconds. TTL 0 = no expiry."""
+        self._client._do("PUT", f"{self._base}/keys/{key}", {"value": value, "ttl": ttl})
+
+    def delete(self, key: str) -> None:
+        """Delete a key."""
+        self._client._do("DELETE", f"{self._base}/keys/{key}")
+
+    def incr(self, key: str, delta: int = 1) -> int:
+        """Atomically increment a key. Creates with delta if missing."""
+        result = self._client._do("POST", f"{self._base}/incr/{key}", {"delta": delta})
+        return result.get("result", {}).get("value", 0)
+
+    def incr_with_ttl(self, key: str, delta: int = 1, ttl: int = 60) -> int:
+        """Atomic increment + set TTL only on first call. For rate limiting."""
+        result = self._client._do("POST", f"{self._base}/incrttl/{key}", {"delta": delta, "ttl": ttl})
+        return result.get("result", {}).get("value", 0)
+
+    def set_nx(self, key: str, value: str, ttl: int = 0) -> bool:
+        """Set only if key doesn't exist. Returns True if set. For distributed locks."""
+        result = self._client._do("POST", f"{self._base}/setnx/{key}", {"value": value, "ttl": ttl})
+        return result.get("result", {}).get("acquired", False)
+
+    def keys(self, pattern: str = "*") -> list[str]:
+        """List keys matching glob pattern (* = any, ? = single char)."""
+        result = self._client._do("GET", f"{self._base}/keys?pattern={_esc(pattern)}")
+        return result.get("result", {}).get("keys", [])
+
+    def flush(self) -> None:
+        """Delete all keys, lists, sets, hashes in this cache."""
+        self._client._do("POST", f"{self._base}/flush")
+
+    def stats(self) -> dict:
+        """Get cache stats: hits, misses, sets, deletes, evictions, key_count, hit_rate."""
+        result = self._client._do("GET", f"{self._base}/stats")
+        return result.get("result", {})
+
+    # ── Data structure accessors ───────────────────────────────
+
+    def list(self, name: str) -> "ListRef":
+        """Return a ListRef for double-headed deque operations."""
+        return ListRef(self, name)
+
+    def set_store(self, name: str) -> "SetRef":
+        """Return a SetRef for unique unordered set operations."""
+        return SetRef(self, name)
+
+    def hash(self, name: str) -> "HashRef":
+        """Return a HashRef for field→value map operations."""
+        return HashRef(self, name)
+
+    def sorted_set(self, name: str) -> "SortedSetRef":
+        """Return a SortedSetRef for score-ordered member operations."""
+        return SortedSetRef(self, name)
+
+    def queue(self, name: str, max_size: int = 0) -> "QueueRef":
+        """Return a QueueRef for FIFO queue operations. max_size=0 for unbounded."""
+        return QueueRef(self, name, max_size)
+
+    def stack(self, name: str, max_size: int = 0) -> "StackRef":
+        """Return a StackRef for LIFO stack operations. max_size=0 for unbounded."""
+        return StackRef(self, name, max_size)
+
+    def pubsub(self, channel: str, max_size: int = 0, max_age_seconds: int = 0) -> "PubSubRef":
+        """Return a PubSubRef for durable pub/sub operations.
+
+        Args:
+            channel: Channel name.
+            max_size: Bound by count (0 = unbounded).
+            max_age_seconds: Auto-expire messages older than this (0 = unbounded).
+        """
+        return PubSubRef(self, channel, max_size, max_age_seconds)
+
+
+class ListRef:
+    """Double-headed deque (list). Push/pop from both ends."""
+
+    def __init__(self, cache: CacheRef, name: str):
+        self._cache = cache
+        self._name = name
+        self._base = f"{cache._base}/list/{_esc(name)}"
+
+    def lpush(self, *values: str) -> int:
+        """Prepend values to head. Returns new length."""
+        r = self._cache._client._do("POST", f"{self._base}/lpush", {"values": list(values)})
+        return r.get("result", {}).get("length", 0)
+
+    def rpush(self, *values: str) -> int:
+        """Append values to tail. Returns new length."""
+        r = self._cache._client._do("POST", f"{self._base}/rpush", {"values": list(values)})
+        return r.get("result", {}).get("length", 0)
+
+    def lpop(self) -> Optional[str]:
+        """Remove and return first element. None if empty."""
+        try:
+            r = self._cache._client._do("POST", f"{self._base}/lpop")
+            return r.get("result", {}).get("value")
+        except APIError as e:
+            if e.status_code == 404: return None
+            raise
+
+    def rpop(self) -> Optional[str]:
+        """Remove and return last element. None if empty."""
+        try:
+            r = self._cache._client._do("POST", f"{self._base}/rpop")
+            return r.get("result", {}).get("value")
+        except APIError as e:
+            if e.status_code == 404: return None
+            raise
+
+    def range(self, start: int = 0, stop: int = -1) -> list[str]:
+        """Return elements from start to stop (inclusive, 0-based, negative from end)."""
+        r = self._cache._client._do("GET", f"{self._base}?start={start}&stop={stop}")
+        return r.get("result", {}).get("values", [])
+
+    def delete(self) -> None:
+        """Delete the entire list."""
+        self._cache._client._do("DELETE", self._base)
+
+
+class SetRef:
+    """Unique unordered set."""
+
+    def __init__(self, cache: CacheRef, name: str):
+        self._cache = cache
+        self._base = f"{cache._base}/set/{_esc(name)}"
+
+    def add(self, *members: str) -> int:
+        """Add members. Returns count of new members added."""
+        r = self._cache._client._do("POST", f"{self._base}/add", {"members": list(members)})
+        return r.get("result", {}).get("added", 0)
+
+    def rem(self, *members: str) -> int:
+        """Remove members. Returns count removed."""
+        r = self._cache._client._do("POST", f"{self._base}/rem", {"members": list(members)})
+        return r.get("result", {}).get("removed", 0)
+
+    def members(self) -> list[str]:
+        """Return all members, sorted."""
+        r = self._cache._client._do("GET", self._base)
+        return r.get("result", {}).get("members", [])
+
+    def delete(self) -> None:
+        """Delete the entire set."""
+        self._cache._client._do("DELETE", self._base)
+
+
+class HashRef:
+    """Field→value map. Store structured data without JSON overhead."""
+
+    def __init__(self, cache: CacheRef, name: str):
+        self._cache = cache
+        self._base = f"{cache._base}/hash/{_esc(name)}"
+
+    def set(self, fields: dict[str, str]) -> None:
+        """Set one or more fields. Upserts existing."""
+        self._cache._client._do("PUT", self._base, {"fields": fields})
+
+    def get(self, field: str) -> Optional[str]:
+        """Get a single field's value. None if missing."""
+        try:
+            r = self._cache._client._do("GET", f"{self._base}/field/{_esc(field)}")
+            return r.get("result", {}).get("value")
+        except APIError as e:
+            if e.status_code == 404: return None
+            raise
+
+    def get_all(self) -> dict[str, str]:
+        """Get all fields."""
+        r = self._cache._client._do("GET", self._base)
+        return r.get("result", {}).get("fields", {})
+
+    def to_json(self) -> str:
+        """Serialize hash to JSON string."""
+        r = self._cache._client._do("GET", f"{self._base}/json")
+        return r.get("result", {}).get("json", "{}")
+
+    def from_json(self, json_str: str) -> None:
+        """Populate hash from JSON object string."""
+        self._cache._client._do("PUT", f"{self._base}/json", {"json": json_str})
+
+    def delete(self) -> None:
+        """Delete the entire hash."""
+        self._cache._client._do("DELETE", self._base)
+
+
+class SortedSetRef:
+    """Members ordered by score. For leaderboards and priority queues."""
+
+    def __init__(self, cache: CacheRef, name: str):
+        self._cache = cache
+        self._base = f"{cache._base}/zset/{_esc(name)}"
+
+    def add(self, *entries: tuple[str, float]) -> int:
+        """Add (member, score) pairs. Returns count of new members."""
+        r = self._cache._client._do("POST", f"{self._base}/add", {
+            "entries": [{"member": m, "score": s} for m, s in entries],
+        })
+        return r.get("result", {}).get("added", 0)
+
+    def score(self, member: str) -> Optional[float]:
+        """Get score of a member. None if not found."""
+        try:
+            r = self._cache._client._do("GET", f"{self._base}/score/{_esc(member)}")
+            return r.get("result", {}).get("score")
+        except APIError:
+            return None
+
+    def rank(self, member: str) -> int:
+        """Get 0-based rank (lowest score = 0). -1 if not found."""
+        try:
+            r = self._cache._client._do("GET", f"{self._base}/rank/{_esc(member)}")
+            return r.get("result", {}).get("rank", -1)
+        except APIError:
+            return -1
+
+    def range(self, start: int = 0, stop: int = -1) -> list[dict]:
+        """Return entries by rank range. Each: {"member": str, "score": float}."""
+        r = self._cache._client._do("GET", f"{self._base}?start={start}&stop={stop}")
+        return r.get("result", {}).get("entries", [])
+
+    def rem(self, *members: str) -> int:
+        """Remove members. Returns count removed."""
+        r = self._cache._client._do("POST", f"{self._base}/rem", {"members": list(members)})
+        return r.get("result", {}).get("removed", 0)
+
+    def incr_by(self, member: str, delta: float) -> float:
+        """Increment member's score. Creates with delta if new."""
+        r = self._cache._client._do("POST", f"{self._base}/incrby", {"member": member, "delta": delta})
+        return r.get("result", {}).get("score", 0)
+
+    def delete(self) -> None:
+        """Delete the entire sorted set."""
+        self._cache._client._do("DELETE", self._base)
+
+
+class QueueRef:
+    """FIFO queue. Bounded queues drop oldest on overflow."""
+
+    def __init__(self, cache: CacheRef, name: str, max_size: int):
+        self._cache = cache
+        self._name = name
+        self._max_size = max_size
+        self._base = f"{cache._base}/queue/{_esc(name)}"
+
+    def enqueue(self, value: str) -> int:
+        """Add to back. Returns new length."""
+        r = self._cache._client._do("POST", f"{self._base}/enqueue", {
+            "value": value, "max_size": self._max_size,
+        })
+        return r.get("result", {}).get("length", 0)
+
+    def dequeue(self) -> Optional[str]:
+        """Remove and return front element (oldest). None if empty."""
+        try:
+            r = self._cache._client._do("POST", f"{self._base}/dequeue")
+            return r.get("result", {}).get("value")
+        except APIError as e:
+            if e.status_code == 404: return None
+            raise
+
+    def peek(self) -> Optional[str]:
+        """Return front element without removing. None if empty."""
+        try:
+            r = self._cache._client._do("GET", self._base)
+            return r.get("result", {}).get("value")
+        except APIError as e:
+            if e.status_code == 404: return None
+            raise
+
+
+class StackRef:
+    """LIFO stack. Bounded stacks drop bottom on overflow."""
+
+    def __init__(self, cache: CacheRef, name: str, max_size: int):
+        self._cache = cache
+        self._max_size = max_size
+        self._base = f"{cache._base}/stack/{_esc(name)}"
+
+    def push(self, value: str) -> int:
+        """Push to top. Returns new length."""
+        r = self._cache._client._do("POST", f"{self._base}/push", {
+            "value": value, "max_size": self._max_size,
+        })
+        return r.get("result", {}).get("length", 0)
+
+    def pop(self) -> Optional[str]:
+        """Pop top element (newest). None if empty."""
+        try:
+            r = self._cache._client._do("POST", f"{self._base}/pop")
+            return r.get("result", {}).get("value")
+        except APIError as e:
+            if e.status_code == 404: return None
+            raise
+
+    def peek(self) -> Optional[str]:
+        """Return top element without removing. None if empty."""
+        try:
+            r = self._cache._client._do("GET", self._base)
+            return r.get("result", {}).get("value")
+        except APIError as e:
+            if e.status_code == 404: return None
+            raise
+
+
+class PubSubRef:
+    """Durable pub/sub channel with broadcast and consumer group support."""
+
+    def __init__(self, cache: CacheRef, channel: str, max_size: int, max_age_seconds: int):
+        self._cache = cache
+        self._channel = channel
+        self._max_size = max_size
+        self._max_age_seconds = max_age_seconds
+        self._base = f"{cache._base}/pubsub/{_esc(channel)}"
+
+    def publish(self, value: str) -> int:
+        """Publish a message. Returns sequence number."""
+        body: dict[str, Any] = {"value": value}
+        if self._max_size > 0:
+            body["max_size"] = self._max_size
+        if self._max_age_seconds > 0:
+            body["max_age_seconds"] = self._max_age_seconds
+        r = self._cache._client._do("POST", f"{self._base}/publish", body)
+        return r.get("result", {}).get("seq", 0)
+
+    def read(self, consumer_id: str, count: int = 50) -> list[dict]:
+        """Read new messages since consumer's last position."""
+        r = self._cache._client._do("GET",
+            f"{self._base}/read?consumer={_esc(consumer_id)}&count={count}")
+        return r.get("result", {}).get("messages", [])
+
+    def create_group(self, group_name: str) -> None:
+        """Create a consumer group (starts from current position)."""
+        self._cache._client._do("POST", f"{self._base}/group/{_esc(group_name)}")
+
+    def claim(self, group_name: str, consumer_id: str) -> Optional[dict]:
+        """Claim next unclaimed message in group. None if no messages."""
+        r = self._cache._client._do("POST",
+            f"{self._base}/group/{_esc(group_name)}/claim?consumer={_esc(consumer_id)}")
+        msg = r.get("result", {}).get("message")
+        return msg
+
+    def ack(self, group_name: str, seq: int) -> None:
+        """Acknowledge a claimed message."""
+        self._cache._client._do("POST",
+            f"{self._base}/group/{_esc(group_name)}/ack", {"seq": seq})
+
+    def delete(self) -> None:
+        """Delete channel and all messages."""
+        self._cache._client._do("DELETE", self._base)
