@@ -165,6 +165,33 @@ class LocalitasClient:
         path = f"/api/permissions/{_esc(app)}/{_esc(resource_type)}/{_esc(resource_id)}/members"
         self._do("DELETE", path, {"user_id": user_id, "group_id": group_id})
 
+    def get_resource_owner(self, app: str, resource_type: str, resource_id: str) -> str:
+        path = f"/api/permissions/{_esc(app)}/{_esc(resource_type)}/{_esc(resource_id)}/owner"
+        result = self._do("GET", path)
+        return result.get("owner_id", "")
+
+    def delete_resource_permissions(self, app: str, resource_type: str, resource_id: str) -> None:
+        path = f"/api/permissions/{_esc(app)}/{_esc(resource_type)}/{_esc(resource_id)}"
+        self._do("DELETE", path)
+
+    def list_accessible_resources(self, app: str, resource_type: str) -> list[dict]:
+        path = f"/api/permissions/accessible?app={_esc(app)}&resource_type={_esc(resource_type)}"
+        result = self._do("GET", path)
+        return result.get("resources", [])
+
+    def get_user_group_ids(self, user_id: str) -> list[str]:
+        path = f"/api/users/{_esc(user_id)}/groups"
+        result = self._do("GET", path)
+        return result.get("group_ids", [])
+
+    def list_users(self) -> list[dict]:
+        result = self._do("GET", "/api/users")
+        return result.get("users", [])
+
+    def list_groups(self) -> list[dict]:
+        result = self._do("GET", "/api/groups")
+        return result.get("groups", [])
+
     # ── Vault ──────────────────────────────────────────────────
 
     def vault_list_credentials(self) -> list[dict]:
