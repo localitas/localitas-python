@@ -725,3 +725,166 @@ class PubSubRef:
     def delete(self) -> None:
         """Delete channel and all messages."""
         self._cache._client._do("DELETE", self._base)
+
+
+class PubSubWS:
+    """WebSocket pub/sub client with automatic reconnection.
+
+    Provides real-time message delivery with exponential backoff reconnect.
+    Re-subscribes to all channels after reconnect. Cursor-based delivery
+    ensures no missed messages.
+
+    Example::
+
+        def on_msg(msg):
+            print(f"seq={msg['seq']} value={msg['value']}")
+
+        ws = PubSubWS("ws://localhost:8080/apps/cache/ws/my-cache", token="lt_xxx")
+        ws.subscribe("events", "consumer-1", on_msg)
+        ws.publish("events", '{"type":"test"}')
+        # ... later
+        ws.close()
+    """
+
+    def __init__(self, url: str, token: str = "",
+                 reconnect_interval: float = 2.0,
+                 max_reconnect_interval: float = 30.0):
+        import threading
+        self._url = url
+        self._token = token
+        self._reconnect_interval = reconnect_interval
+        self._max_reconnect_interval = max_reconnect_interval
+        self._ws = None
+        self._subscriptions: dict[str, dict] = {}
+        self._listeners: dict[str, list] = {}
+        self._reconnect_attempts = 0
+        self._intentional_close = False
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self.connect()
+
+    def connect(self):
+        """Connect to the WebSocket server. Called automatically on construction."""
+        import websocket
+        import threading
+
+        url = self._url
+        if self._token:
+            sep = "&" if "?" in url else "?"
+            url += f"{sep}token={urllib.parse.quote(self._token)}"
+
+        header = []
+        if self._token:
+            header.append(f"Authorization: Bearer {self._token}")
+
+        self._ws = websocket.WebSocketApp(
+            url,
+            header=header,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_close=self._on_close,
+            on_error=self._on_error,
+        )
+        self._thread = threading.Thread(target=self._ws.run_forever, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        """Disconnect. Does not auto-reconnect."""
+        self._intentional_close = True
+        if self._ws:
+            self._ws.close()
+            self._ws = None
+
+    def subscribe(self, channel: str, consumer: str, callback):
+        """Subscribe to a channel with a callback for each message.
+
+        Args:
+            channel: Channel name.
+            consumer: Consumer ID for cursor tracking.
+            callback: Called with dict containing seq, value, channel.
+        """
+        with self._lock:
+            self._subscriptions[channel] = {"consumer": consumer, "callback": callback}
+        self._send({"action": "subscribe", "channel": channel, "consumer": consumer})
+
+    def unsubscribe(self, channel: str):
+        """Unsubscribe from a channel."""
+        with self._lock:
+            self._subscriptions.pop(channel, None)
+        self._send({"action": "unsubscribe", "channel": channel})
+
+    def publish(self, channel: str, value: str,
+                max_size: int = 0, max_age_seconds: int = 0):
+        """Publish a message to a channel."""
+        msg: dict[str, Any] = {"action": "publish", "channel": channel, "value": value}
+        if max_size > 0:
+            msg["max_size"] = max_size
+        if max_age_seconds > 0:
+            msg["max_age_seconds"] = max_age_seconds
+        self._send(msg)
+
+    def ack(self, channel: str, group: str, seq: int):
+        """Acknowledge a consumer group message."""
+        self._send({"action": "ack", "channel": channel, "group": group, "seq": seq})
+
+    def on(self, event: str, callback):
+        """Register an event listener.
+
+        Events: connected, disconnected, error, reconnecting
+        """
+        with self._lock:
+            self._listeners.setdefault(event, []).append(callback)
+
+    def _send(self, data: dict):
+        if self._ws and self._ws.sock and self._ws.sock.connected:
+            self._ws.send(json.dumps(data))
+
+    def _emit(self, event: str, data=None):
+        with self._lock:
+            cbs = list(self._listeners.get(event, []))
+        for cb in cbs:
+            cb(data)
+
+    def _on_open(self, ws):
+        self._reconnect_attempts = 0
+        self._emit("connected")
+        with self._lock:
+            subs = dict(self._subscriptions)
+        for channel, sub in subs.items():
+            self._send({"action": "subscribe", "channel": channel,
+                         "consumer": sub["consumer"]})
+
+    def _on_message(self, ws, message: str):
+        try:
+            msg = json.loads(message)
+        except json.JSONDecodeError:
+            return
+        self._emit(msg.get("type", ""), msg)
+        if msg.get("type") == "message" and msg.get("channel"):
+            with self._lock:
+                sub = self._subscriptions.get(msg["channel"])
+            if sub and sub.get("callback"):
+                sub["callback"]({"seq": msg.get("seq"), "value": msg.get("value"),
+                                  "channel": msg["channel"]})
+
+    def _on_close(self, ws, close_status_code=None, close_msg=None):
+        self._emit("disconnected")
+        if not self._intentional_close:
+            self._reconnect()
+
+    def _on_error(self, ws, error):
+        self._emit("error", error)
+
+    def _reconnect(self):
+        import threading
+        self._reconnect_attempts += 1
+        delay = min(
+            self._reconnect_interval * (1.5 ** (self._reconnect_attempts - 1)),
+            self._max_reconnect_interval,
+        )
+        if delay >= self._max_reconnect_interval:
+            self._reconnect_attempts = 0
+        self._emit("reconnecting", {"attempt": self._reconnect_attempts, "delay": delay})
+        timer = threading.Timer(delay, self.connect)
+        timer.daemon = True
+        timer.start()
