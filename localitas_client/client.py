@@ -333,17 +333,17 @@ class CacheRef:
 
     def incr(self, key: str, delta: int = 1) -> int:
         """Atomically increment a key. Creates with delta if missing."""
-        result = self._client._do("POST", f"{self._base}/keys/{key}/incr", {"delta": delta})
+        result = self._client._do("POST", f"{self._base}/keys/incr/{key}", {"delta": delta})
         return result.get("result", {}).get("value", 0)
 
     def incr_with_ttl(self, key: str, delta: int = 1, ttl: int = 60) -> int:
         """Atomic increment + set TTL only on first call. For rate limiting."""
-        result = self._client._do("POST", f"{self._base}/keys/{key}/incrttl", {"delta": delta, "ttl": ttl})
+        result = self._client._do("POST", f"{self._base}/keys/incrttl/{key}", {"delta": delta, "ttl": ttl})
         return result.get("result", {}).get("value", 0)
 
     def set_nx(self, key: str, value: str, ttl: int = 0) -> bool:
         """Set only if key doesn't exist. Returns True if set. For distributed locks."""
-        result = self._client._do("POST", f"{self._base}/keys/{key}/setnx", {"value": value, "ttl": ttl})
+        result = self._client._do("POST", f"{self._base}/keys/setnx/{key}", {"value": value, "ttl": ttl})
         return result.get("result", {}).get("acquired", False)
 
     def keys(self, pattern: str = "*") -> list[str]:
