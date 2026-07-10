@@ -333,17 +333,17 @@ class CacheRef:
 
     def incr(self, key: str, delta: int = 1) -> int:
         """Atomically increment a key. Creates with delta if missing."""
-        result = self._client._do("POST", f"{self._base}/incr/{key}", {"delta": delta})
+        result = self._client._do("POST", f"{self._base}/keys/{key}/incr", {"delta": delta})
         return result.get("result", {}).get("value", 0)
 
     def incr_with_ttl(self, key: str, delta: int = 1, ttl: int = 60) -> int:
         """Atomic increment + set TTL only on first call. For rate limiting."""
-        result = self._client._do("POST", f"{self._base}/incrttl/{key}", {"delta": delta, "ttl": ttl})
+        result = self._client._do("POST", f"{self._base}/keys/{key}/incrttl", {"delta": delta, "ttl": ttl})
         return result.get("result", {}).get("value", 0)
 
     def set_nx(self, key: str, value: str, ttl: int = 0) -> bool:
         """Set only if key doesn't exist. Returns True if set. For distributed locks."""
-        result = self._client._do("POST", f"{self._base}/setnx/{key}", {"value": value, "ttl": ttl})
+        result = self._client._do("POST", f"{self._base}/keys/{key}/setnx", {"value": value, "ttl": ttl})
         return result.get("result", {}).get("acquired", False)
 
     def keys(self, pattern: str = "*") -> list[str]:
@@ -413,7 +413,7 @@ class ListRef:
     def __init__(self, cache: CacheRef, name: str):
         self._cache = cache
         self._name = name
-        self._base = f"{cache._base}/list/{_esc(name)}"
+        self._base = f"{cache._base}/lists/{_esc(name)}"
 
     def lpush(self, *values: str) -> int:
         """Prepend values to head. Returns new length."""
@@ -466,7 +466,7 @@ class SetRef:
 
     def __init__(self, cache: CacheRef, name: str):
         self._cache = cache
-        self._base = f"{cache._base}/set/{_esc(name)}"
+        self._base = f"{cache._base}/sets/{_esc(name)}"
 
     def add(self, *members: str) -> int:
         """Add members. Returns count of new members added."""
@@ -503,7 +503,7 @@ class HashRef:
 
     def __init__(self, cache: CacheRef, name: str):
         self._cache = cache
-        self._base = f"{cache._base}/hash/{_esc(name)}"
+        self._base = f"{cache._base}/hashes/{_esc(name)}"
 
     def set(self, fields: dict[str, str]) -> None:
         """Set one or more fields. Upserts existing."""
@@ -512,7 +512,7 @@ class HashRef:
     def get(self, field: str) -> Optional[str]:
         """Get a single field's value. None if missing."""
         try:
-            r = self._cache._client._do("GET", f"{self._base}/field/{_esc(field)}")
+            r = self._cache._client._do("GET", f"{self._base}/fields/{_esc(field)}")
             return r.get("result", {}).get("value")
         except APIError as e:
             if e.status_code == 404: return None
@@ -553,7 +553,7 @@ class SortedSetRef:
 
     def __init__(self, cache: CacheRef, name: str):
         self._cache = cache
-        self._base = f"{cache._base}/zset/{_esc(name)}"
+        self._base = f"{cache._base}/zsets/{_esc(name)}"
 
     def add(self, *entries: tuple[str, float]) -> int:
         """Add (member, score) pairs. Returns count of new members."""
@@ -614,7 +614,7 @@ class QueueRef:
         self._cache = cache
         self._name = name
         self._max_size = max_size
-        self._base = f"{cache._base}/queue/{_esc(name)}"
+        self._base = f"{cache._base}/queues/{_esc(name)}"
 
     def enqueue(self, value: str) -> int:
         """Add to back. Returns new length."""
@@ -657,7 +657,7 @@ class StackRef:
     def __init__(self, cache: CacheRef, name: str, max_size: int):
         self._cache = cache
         self._max_size = max_size
-        self._base = f"{cache._base}/stack/{_esc(name)}"
+        self._base = f"{cache._base}/stacks/{_esc(name)}"
 
     def push(self, value: str) -> int:
         """Push to top. Returns new length."""
