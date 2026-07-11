@@ -216,6 +216,10 @@ class LocalitasClient:
         """Delete a named cache. Cannot delete 'public_paths'."""
         self._do("DELETE", f"/apps/cache/api/caches/{_esc(name)}")
 
+    def automation(self) -> "AutomationClient":
+        """Return an AutomationClient for run management and async job signaling."""
+        return AutomationClient(self)
+
     def cache(self, name: str) -> "CacheRef":
         """Return a CacheRef for key-value and data structure operations.
 
@@ -752,6 +756,36 @@ class PubSubRef:
     def delete(self) -> None:
         """Delete channel and all messages."""
         self._cache._client._do("DELETE", self._base)
+
+
+class AutomationClient:
+    """Client for automation run management and async job signaling."""
+
+    def __init__(self, client: "LocalitasClient"):
+        self._client = client
+
+    def trigger(self, automation_id: str) -> dict:
+        """Trigger an automation and return the run."""
+        return self._client._do("POST", f"/apps/automation/api/automations/{automation_id}/trigger")
+
+    def get_run(self, run_id: str) -> dict:
+        """Get a run by ID."""
+        return self._client._do("GET", f"/apps/automation/api/runs/{run_id}")
+
+    def publish_result(self, run_id: str, status: str = "completed", result: dict = None, error: str = ""):
+        """Signal async job completion. Called from inside the background job."""
+        payload = {"status": status, "result": result or {}, "error": error}
+        return self._client._do("POST", f"/apps/automation/api/runs/{run_id}/complete", payload)
+
+    def wait_for_run(self, run_id: str, timeout: float = 3600, poll_interval: float = 2.0) -> dict:
+        """Wait for a run to complete by polling. Returns the completed run."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            run = self.get_run(run_id)
+            if run.get("status") not in ("running", "pending"):
+                return run
+            time.sleep(poll_interval)
+        raise TimeoutError(f"Timeout waiting for run {run_id}")
 
 
 class PubSubWS:
