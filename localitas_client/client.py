@@ -777,15 +777,36 @@ class AutomationClient:
         payload = {"status": status, "result": result or {}, "error": error}
         return self._client._do("POST", f"/apps/automation/api/runs/{run_id}/complete", payload)
 
-    def wait_for_run(self, run_id: str, timeout: float = 3600, poll_interval: float = 2.0) -> dict:
-        """Wait for a run to complete by polling. Returns the completed run."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            run = self.get_run(run_id)
-            if run.get("status") not in ("running", "pending"):
-                return run
-            time.sleep(poll_interval)
-        raise TimeoutError(f"Timeout waiting for run {run_id}")
+    def wait_for_run(self, run_id: str, timeout: float = 3600) -> dict:
+        """Wait for a run to complete via WebSocket pubsub. Returns the completed run."""
+        import threading
+
+        ws_url = self._client.base_url.replace("http://", "ws://").replace("https://", "wss://")
+        ws_url += "/apps/cache/ws/localitas_automations"
+
+        result_holder = [None]
+        event = threading.Event()
+
+        ps = PubSubWS(ws_url, self._client.token)
+        consumer_id = f"sdk-wait-{run_id}-{int(time.time()*1000)}"
+
+        def on_msg(msg):
+            try:
+                payload = json.loads(msg.get("value", "{}"))
+                if payload.get("run_id") == run_id:
+                    result_holder[0] = self.get_run(run_id)
+                    event.set()
+            except Exception:
+                pass
+
+        ps.subscribe("completions", consumer_id, on_msg)
+
+        try:
+            if event.wait(timeout=timeout):
+                return result_holder[0]
+            raise TimeoutError(f"Timeout waiting for run {run_id}")
+        finally:
+            ps.close()
 
 
 class PubSubWS:
