@@ -8,6 +8,10 @@ from typing import Any, Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+# Header the platform sets on automation-triggered HTTP calls; carries the run
+# ID a handler publishes its async result back to (see AutomationClient.run_async).
+AUTOMATION_RUN_ID_HEADER = "Localitas-Automation-Run-ID"
+
 
 def default_token() -> str:
     """Read the API token from ~/.localitas/config-core.yaml (core.auth.api_token).
@@ -138,6 +142,17 @@ class LocalitasClient:
             raise APIError("GET", f"/services/{name}", 404, f"service {name!r} not found")
         return result["rows"][0][0]
 
+    def list_services(self) -> list[dict]:
+        db = self.create_database("service_registry", system=True)
+        result = self.sql_query(db["id"], "SELECT name, url, updated_at FROM services ORDER BY name")
+        return [{"name": r[0], "url": r[1]} for r in result.get("rows", [])]
+
+    def register_external_app(self, name: str, display_name: str, url: str, icon: str = "") -> None:
+        """Register this app into the platform app registry (app selector UI)."""
+        self._do("POST", "/apps/ext", {
+            "name": name, "display_name": display_name, "url": url, "icon": icon,
+        })
+
     # ── Permissions ────────────────────────────────────────────
 
     def set_resource_owner(self, app: str, resource_type: str, resource_id: str, owner_id: str) -> None:
@@ -200,6 +215,48 @@ class LocalitasClient:
 
     def vault_get_secrets(self, public_id: str) -> dict[str, str]:
         return self._do("GET", f"/apps/vault/api/credentials/{_esc(public_id)}/secrets")
+
+    def vault_create_credential(self, name: str, url: str = "", keychain_sync: bool = False, data: Optional[dict] = None) -> dict:
+        return self._do("POST", "/apps/vault/api/credentials", {
+            "name": name, "url": url, "keychain_sync": keychain_sync, "data": data or {},
+        })
+
+    def vault_update_credential(self, public_id: str, name: str, url: str = "", keychain_sync: bool = False, data: Optional[dict] = None) -> None:
+        self._do("PUT", f"/apps/vault/api/credentials/{_esc(public_id)}", {
+            "name": name, "url": url, "keychain_sync": keychain_sync, "data": data or {},
+        })
+
+    def vault_delete_credential(self, public_id: str) -> None:
+        self._do("DELETE", f"/apps/vault/api/credentials/{_esc(public_id)}")
+
+    # ── Metrics (TSDB) ─────────────────────────────────────────
+
+    def ingest_metrics(self, metrics: list[dict]) -> int:
+        """Ingest structured metric points. Each metric is a dict with keys
+        name, value, and optionally type and tags. Returns the accepted count."""
+        result = self._do("POST", "/apps/tsdb/api/ingest", {"metrics": metrics})
+        return (result or {}).get("accepted", 0)
+
+    def ingest_dogstatsd(self, lines: str) -> int:
+        """Ingest DogStatsD-format metric lines (text/plain). Returns accepted count."""
+        url = self.base_url + "/apps/tsdb/api/ingest"
+        req = Request(url, data=lines.encode(), method="POST")
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Content-Type", "text/plain")
+        try:
+            with urlopen(req, timeout=30) as resp:
+                resp_body = resp.read().decode()
+                return (json.loads(resp_body).get("accepted", 0) if resp_body else 0)
+        except HTTPError as e:
+            raise APIError("POST", "/apps/tsdb/api/ingest", e.code, e.read().decode()) from None
+
+    # ── Notifications ──────────────────────────────────────────
+
+    def create_notification(self, title: str, message: str = "", app: str = "", level: str = "") -> None:
+        self._do("POST", "/api/notifications", {
+            "app": app, "level": level, "title": title, "message": message,
+        })
 
     # ── Cache ──────────────────────────────────────────────────
 
@@ -776,6 +833,34 @@ class AutomationClient:
         """Signal async job completion. Called from inside the background job."""
         payload = {"status": status, "result": result or {}, "error": error}
         return self._client._do("POST", f"/apps/automation/api/runs/{run_id}/complete", payload)
+
+    def run_async(self, run_id: str, work) -> bool:
+        """Run ``work`` in a background thread and publish its result back to the
+        automation run when done. ``work`` is a zero-arg callable returning a
+        dict (or None). Returns True if a run_id was supplied (so the handler
+        should respond 202 immediately), False otherwise — mirroring the Go
+        RunAsync fire-and-202 pattern. Extract run_id from the request's
+        ``AUTOMATION_RUN_ID_HEADER`` header before calling.
+        """
+        if not run_id:
+            return False
+
+        import threading
+
+        def _run():
+            start = time.time()
+            status, error, result = "completed", "", None
+            try:
+                result = work()
+            except Exception as exc:  # noqa: BLE001 - report failure to the run
+                status, error = "failed", str(exc)
+            if result is None:
+                result = {}
+            result["duration_ms"] = int((time.time() - start) * 1000)
+            self.publish_result(run_id, status, result, error)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
 
     def wait_for_run(self, run_id: str, timeout: float = 3600) -> dict:
         """Wait for a run to complete via WebSocket pubsub. Returns the completed run."""
