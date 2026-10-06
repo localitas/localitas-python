@@ -118,12 +118,6 @@ class LocalitasClient:
             path += f"&database_id={_esc(database_id)}"
         return self._do("GET", path)
 
-    def search_hybrid(self, query: str, limit: int = 100, database_id: str = "") -> dict:
-        body: dict[str, Any] = {"q": query, "limit": limit}
-        if database_id:
-            body["database_id"] = database_id
-        return self._do("POST", "/apps/data/api/search/hybrid", body)
-
     # ── Service Registry ───────────────────────────────────────
 
     def register_service(self, name: str, url: str) -> None:
