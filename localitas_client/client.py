@@ -149,17 +149,36 @@ class LocalitasClient:
 
     # ── Permissions ────────────────────────────────────────────
 
-    def set_resource_owner(self, app: str, resource_type: str, resource_id: str, owner_id: str) -> None:
+    def claim_resource(self, app: str, resource_type: str, resource_id: str) -> None:
+        """Make the calling user the owner of an unowned resource (or one it already owns)."""
         self._do("POST", "/api/permissions/set-owner", {
-            "app": app, "resource_type": resource_type, "resource_id": resource_id, "owner_id": owner_id,
+            "app": app, "resource_type": resource_type, "resource_id": resource_id,
         })
 
-    def check_permission(self, app: str, resource_type: str, resource_id: str, user_id: str = "") -> str:
-        body: dict[str, str] = {"app": app, "resource_type": resource_type, "resource_id": resource_id}
-        if user_id:
-            body["user_id"] = user_id
-        result = self._do("POST", "/api/permissions/check", body)
+    def check_permission(self, app: str, resource_type: str, resource_id: str) -> str:
+        """The calling user's permission on a resource ("" for none)."""
+        result = self._do("POST", "/api/permissions/check", {
+            "app": app, "resource_type": resource_type, "resource_id": resource_id,
+        })
         return result.get("permission", "")
+
+    # The *_as_user methods let an app backend, holding an admin-scoped system
+    # token, act for the user making the request.
+
+    def set_resource_owner_as_user(self, user_id: str, app: str, resource_type: str, resource_id: str) -> None:
+        self._do("POST", f"/api/permissions/users/{_esc(user_id)}/set-owner", {
+            "app": app, "resource_type": resource_type, "resource_id": resource_id,
+        })
+
+    def check_permission_as_user(self, user_id: str, app: str, resource_type: str, resource_id: str) -> str:
+        result = self._do("POST", f"/api/permissions/users/{_esc(user_id)}/check", {
+            "app": app, "resource_type": resource_type, "resource_id": resource_id,
+        })
+        return result.get("permission", "")
+
+    def delete_resource_permissions_as_user(self, user_id: str, app: str, resource_type: str, resource_id: str) -> None:
+        path = f"/api/permissions/users/{_esc(user_id)}/resources/{_esc(app)}/{_esc(resource_type)}/{_esc(resource_id)}"
+        self._do("DELETE", path)
 
     def list_resource_members(self, app: str, resource_type: str, resource_id: str) -> list[dict]:
         path = f"/api/permissions/{_esc(app)}/{_esc(resource_type)}/{_esc(resource_id)}/members"
