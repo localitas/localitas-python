@@ -19,26 +19,32 @@ _LEGACY_RE = re.compile(r"^(\d+)_(.+)\.sql$")
 class Migrator:
     """Applies SQL migrations from ``migrations_dir`` against a database.
 
-    ``exec_sql(sql, *args)`` and ``query_sql(sql, *args)`` are callables — pass
-    ``client.sql_exec``/``client.sql_query`` bound to a database id, e.g.::
+    ``exec_sql(sql, *args)`` and ``query_sql(sql, *args)`` run one statement;
+    ``exec_tx(statements)`` applies a list of ``(sql, args)`` pairs as one
+    transaction. Bound to a database id, e.g.::
 
         m = Migrator(
             "migrations",
             lambda sql, *a: client.sql_exec(db_id, sql, *a),
             lambda sql, *a: client.sql_query(db_id, sql, *a),
+            lambda stmts: client.sql_transaction(
+                db_id, [{"sql": s, "args": list(a)} for s, a in stmts]),
         )
         m.run()
     """
 
-    def __init__(self, migrations_dir, exec_sql, query_sql):
+    def __init__(self, migrations_dir, exec_sql, query_sql, exec_tx):
         self._dir = migrations_dir
         self._exec = exec_sql
         self._query = query_sql
+        self._exec_tx = exec_tx
         self._migrations = _load_migrations(migrations_dir)
 
     def run(self):
-        """Apply all pending migrations. Idempotent — already-applied
-        migrations are skipped and 'already exists' errors are tolerated."""
+        """Apply every pending migration. Each is one transaction that records
+        its version before its statements, so it applies whole or not at all,
+        and of several nodes migrating at once exactly one applies it: the
+        others' transactions fail on the version's primary key."""
         self._exec(
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
             "version TEXT PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)"
@@ -50,16 +56,39 @@ class Migrator:
         for version, name, sql in self._migrations:
             if version in applied:
                 continue
-            for stmt in _split_sql(sql):
-                try:
-                    self._exec(stmt)
-                except Exception as exc:  # noqa: BLE001
-                    if not _is_idempotent_error(exc):
-                        raise
-            self._exec(
-                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-                version, name, int(time.time()),
-            )
+            try:
+                self._apply(version, name, sql)
+            except Exception as exc:  # noqa: BLE001
+                if _is_version_taken(exc):
+                    continue
+                if not _is_idempotent_error(exc):
+                    raise
+                # The schema change is in place without its version row (a
+                # database migrated before migrations were atomic).
+                self._repair(version, name, sql)
+
+    def _apply(self, version, name, sql):
+        record = (
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+            (version, name, int(time.time())),
+        )
+        self._exec_tx([record] + [(stmt, ()) for stmt in _split_sql(sql)])
+
+    def _repair(self, version, name, sql):
+        for stmt in _split_sql(sql):
+            try:
+                self._exec(stmt)
+            except Exception as exc:  # noqa: BLE001
+                if not _is_idempotent_error(exc):
+                    raise
+        self._exec(
+            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+            version, name, int(time.time()),
+        )
+
+
+def _is_version_taken(exc):
+    return "UNIQUE constraint failed: schema_migrations.version" in str(exc)
 
 
 def _load_migrations(migrations_dir):
