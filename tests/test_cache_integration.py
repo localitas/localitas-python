@@ -2,7 +2,6 @@
 
 Run: make integration-cluster-start && python -m pytest tests/test_cache_integration.py -v
 """
-import base64
 import json
 import time
 import unittest
@@ -10,12 +9,9 @@ import unittest
 from localitas_client import LocalitasClient
 
 INTEG_URL = "http://localhost:9090"
-INTEG_USER = {
-    "user_id": "11111111-1111-1111-1111-111111111111",
-    "email": "alice@test.local",
-    "name": "Alice Admin",
-}
-INTEG_TOKEN = base64.b64encode(json.dumps(INTEG_USER).encode()).decode()
+# The integration cluster's seeded API token for alice@test.local
+# (core seeds/005_integ_api_token.sql).
+INTEG_TOKEN = "lt_integ_a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
 
 
 def make_client():
@@ -298,8 +294,8 @@ class TestCacheWebSocket(unittest.TestCase):
         except ImportError:
             self.skipTest("websocket-client not installed")
 
-        ws_url = f"ws://localhost:9090/apps/cache/ws/{self.cache_name}?token={INTEG_TOKEN}"
-        ws = websocket.create_connection(ws_url, timeout=5)
+        ws_url = f"ws://localhost:9090/apps/cache/ws/{self.cache_name}"
+        ws = websocket.create_connection(ws_url, timeout=5, header=[f"Authorization: Bearer {INTEG_TOKEN}"])
 
         connected = json.loads(ws.recv())
         self.assertEqual(connected["type"], "connected")
