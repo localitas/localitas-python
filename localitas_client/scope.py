@@ -1,13 +1,17 @@
 """Server-side auth/scope helpers — mirrors the Go client's scope.go + auth.go.
 
-For apps that expose their own HTTP endpoints (the external-app model): parse
-the platform bearer token (base64-encoded JSON) and enforce a minimum scope.
+For apps that expose their own HTTP endpoints (the external-app model): verify
+the identity token core puts on every request it forwards to the app, and
+enforce a minimum scope.
 
 The scope hierarchy is: guest < read < write < admin.
 """
 
 import base64
+import hashlib
+import hmac
 import json
+import os
 
 SCOPE_GUEST = ""
 SCOPE_READ = "read"
@@ -26,16 +30,55 @@ def has_scope(user_scope: str, required: str) -> bool:
     return scope_rank(user_scope) >= scope_rank(required)
 
 
+_IDENTITY_KEY_DOMAIN = "localitas-internal-token-v1"
+_identity_key = None
+
+
+def set_identity_key_from_api_token(api_token: str) -> None:
+    """Verify identity tokens with the key core derives from its API token.
+    Apps normally need not call this: the key is derived from
+    LOCALITAS_API_TOKEN, or the token in ~/.localitas/config-core.yaml."""
+    global _identity_key
+    _identity_key = _derive_identity_key(api_token)
+
+
+def _derive_identity_key(api_token: str) -> bytes:
+    if not api_token:
+        return b""
+    digest = hashlib.sha256(f"{_IDENTITY_KEY_DOMAIN}:{api_token}".encode()).digest()
+    return base64.standard_b64encode(digest)
+
+
+def _current_identity_key() -> bytes:
+    global _identity_key
+    if _identity_key is None:
+        from .client import default_token
+
+        _identity_key = _derive_identity_key(os.environ.get("LOCALITAS_API_TOKEN") or default_token())
+    return _identity_key
+
+
+def _b64url_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
 def parse_bearer_token(token: str) -> dict:
-    """Decode a Localitas bearer token (base64 JSON) into its identity claims:
-    ``user_id``, ``email``, ``name``, ``permission``. Client-side parse only —
-    does not validate against the server. Raises ValueError on malformed input."""
-    try:
-        decoded = base64.standard_b64decode(token)
-    except Exception:
-        # Tolerate un-padded base64.
-        decoded = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-    claims = json.loads(decoded)
+    """Verify an identity token core put on a forwarded request
+    ("payload.signature": base64url JSON claims and their HMAC-SHA256 under
+    the key core derives from its API token) and return its claims:
+    ``user_id``, ``email``, ``name``, ``permission``. Raises ValueError for an
+    unsigned, tampered or wrong-key token, so a caller cannot claim to be
+    another user."""
+    key = _current_identity_key()
+    if not key:
+        raise ValueError("no identity key: set LOCALITAS_API_TOKEN")
+    payload, sep, sig = token.partition(".")
+    if not sep or not payload or not sig:
+        raise ValueError("identity token is not signed")
+    expected = base64.urlsafe_b64encode(hmac.new(key, payload.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
+    if not hmac.compare_digest(sig, expected):
+        raise ValueError("identity token signature does not verify")
+    claims = json.loads(_b64url_decode(payload))
     if not isinstance(claims, dict):
         raise ValueError("token payload is not an object")
     return claims

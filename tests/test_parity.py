@@ -2,6 +2,8 @@
 and the new client methods (vault writes, metrics, register_external_app)."""
 
 import base64
+import hashlib
+import hmac
 import json
 import os
 import tempfile
@@ -41,22 +43,66 @@ class TestMigratorParsing(unittest.TestCase):
         self.assertIn("TRIGGER", stmts[0])
 
 
+TEST_API_TOKEN = "lt_test_cluster_token"
+
+
+def sign_test_token(api_token, claims):
+    """Sign claims exactly as core does: base64url JSON, a dot, and the
+    base64url HMAC-SHA256 of the payload under the key derived from the
+    cluster API token."""
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
+    key = base64.standard_b64encode(hashlib.sha256(f"localitas-internal-token-v1:{api_token}".encode()).digest())
+    sig = base64.urlsafe_b64encode(hmac.new(key, payload.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
+    return f"{payload}.{sig}"
+
+
 class TestScope(unittest.TestCase):
     def test_hierarchy(self):
         self.assertTrue(scope.has_scope(scope.SCOPE_ADMIN, scope.SCOPE_WRITE))
         self.assertTrue(scope.has_scope(scope.SCOPE_WRITE, scope.SCOPE_READ))
         self.assertFalse(scope.has_scope(scope.SCOPE_READ, scope.SCOPE_WRITE))
 
+    def setUp(self):
+        scope.set_identity_key_from_api_token(TEST_API_TOKEN)
+
     def test_parse_bearer_token(self):
-        claims = {"user_id": "u1", "email": "a@b.c", "permission": "write"}
-        token = base64.b64encode(json.dumps(claims).encode()).decode()
+        token = sign_test_token(TEST_API_TOKEN, {"user_id": "u1", "email": "a@b.c", "permission": "write"})
         parsed = scope.parse_bearer_token(token)
         self.assertEqual(parsed["user_id"], "u1")
         self.assertEqual(parsed["permission"], "write")
 
+    def test_verifies_core_signed_token(self):
+        # What core signs for these claims under TEST_API_TOKEN; core's
+        # internal/auth golden test pins the same string.
+        golden = "eyJlbWFpbCI6ImFsaWNlQHRlc3QubG9jYWwiLCJuYW1lIjoiQWxpY2UiLCJ1c2VyX2lkIjoidTEiLCJwZXJtaXNzaW9uIjoid3JpdGUifQ.qpBZu3EVKLK3lKw_8Y2WD_VP9nCqx849D30L0r9fo5Y"
+        claims = scope.parse_bearer_token(golden)
+        self.assertEqual((claims["user_id"], claims["email"], claims["name"], claims["permission"]),
+                         ("u1", "alice@test.local", "Alice", "write"))
+
+    def test_rejects_forged_tokens(self):
+        claims = {"user_id": "alice", "email": "a@b.c", "permission": "admin"}
+        signed = sign_test_token(TEST_API_TOKEN, {"user_id": "bob", "permission": "read"})
+        _, _, sig = signed.partition(".")
+        edited = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode() + "." + sig
+        for name, token in {
+            "unsigned base64 claims": base64.b64encode(json.dumps(claims).encode()).decode(),
+            "other key": sign_test_token("another-cluster", claims),
+            "edited claims": edited,
+            "lt_ token": "lt_abc",
+        }.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    scope.parse_bearer_token(token)
+                with self.assertRaises(PermissionError):
+                    scope.require_scope(f"Bearer {token}", scope.SCOPE_READ)
+
+    def test_no_key_rejects_everything(self):
+        scope.set_identity_key_from_api_token("")
+        with self.assertRaises(ValueError):
+            scope.parse_bearer_token(sign_test_token(TEST_API_TOKEN, {"user_id": "u1"}))
+
     def test_require_scope_grants_and_denies(self):
-        claims = {"user_id": "u1", "email": "a@b.c", "permission": "write"}
-        token = base64.b64encode(json.dumps(claims).encode()).decode()
+        token = sign_test_token(TEST_API_TOKEN, {"user_id": "u1", "email": "a@b.c", "permission": "write"})
         header = f"Bearer {token}"
         self.assertEqual(scope.require_scope(header, scope.SCOPE_WRITE)["user_id"], "u1")
         with self.assertRaises(PermissionError):
