@@ -61,6 +61,9 @@ class TestClient(unittest.TestCase):
         def handle_create_database(headers, body, path):
             return 200, {"id": "db2", "name": body["name"], "system": body.get("system", False)}
 
+        def handle_create_system_database(headers, body, path):
+            return 200, {"id": "db3", "name": body["name"], "system": True}
+
         def handle_get_database(headers, body, path):
             return 200, {"id": "db1", "name": "mydb"}
 
@@ -84,6 +87,7 @@ class TestClient(unittest.TestCase):
         self.server, self.base_url = start_mock_server({
             "GET /apps/data/api/databases": handle_list_databases,
             "POST /apps/data/api/databases": handle_create_database,
+            "POST /apps/data/api/system-dbs": handle_create_system_database,
             "GET /apps/data/api/databases/db1": handle_get_database,
             "DELETE /apps/data/api/databases/db1": handle_delete_database,
             "POST /apps/data/api/databases/db1/query": handle_sql_query,

@@ -58,10 +58,9 @@ class LocalitasClient:
         return self._do("GET", "/apps/data/api/databases")
 
     def create_database(self, name: str, system: bool = False) -> dict:
-        body = {"name": name}
         if system:
-            body["system"] = True
-        return self._do("POST", "/apps/data/api/databases", body)
+            return self._do("POST", "/apps/data/api/system-dbs", {"name": name})
+        return self._do("POST", "/apps/data/api/databases", {"name": name})
 
     def get_database(self, db_id: str) -> dict:
         return self._do("GET", f"/apps/data/api/databases/{_esc(db_id)}")
