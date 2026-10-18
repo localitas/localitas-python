@@ -64,6 +64,8 @@ class TestScope(unittest.TestCase):
 
     def setUp(self):
         scope.set_identity_key_from_api_token(TEST_API_TOKEN)
+        scope.set_identity_public_keys()
+        scope.reset_accept_legacy_identity_tokens()
 
     def test_parse_bearer_token(self):
         token = sign_test_token(TEST_API_TOKEN, {"user_id": "u1", "email": "a@b.c", "permission": "write"})

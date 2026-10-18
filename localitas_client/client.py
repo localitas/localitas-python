@@ -12,6 +12,13 @@ from urllib.error import HTTPError
 # ID a handler publishes its async result back to (see AutomationClient.run_async).
 AUTOMATION_RUN_ID_HEADER = "Localitas-Automation-Run-ID"
 
+# How close to its expiry a client refreshes the identity token it acts with.
+_REFRESH_BEFORE_SECONDS = 60
+
+
+def _now() -> float:
+    return time.time()
+
 
 def default_token() -> str:
     """Read the API token from ~/.localitas/config-core.yaml (core.auth.api_token).
@@ -51,6 +58,35 @@ class LocalitasClient:
 
     def with_token(self, token: str) -> "LocalitasClient":
         return LocalitasClient(self.base_url, token)
+
+    def _bearer(self) -> str:
+        """The token to send. An identity token within a minute of its expiry
+        is first refreshed with core (POST /api/auth/identity/refresh), up to
+        the max claim core fixed when it minted it; if the refresh fails the
+        current token is sent and core decides."""
+        from .scope import unverified_claims
+
+        claims = unverified_claims(self.token) if self.token else {}
+        exp, limit = int(claims.get("exp") or 0), int(claims.get("max") or 0)
+        if exp and limit > exp and exp - _now() < _REFRESH_BEFORE_SECONDS:
+            req = Request(self.base_url + "/api/auth/identity/refresh", data=b"", method="POST")
+            req.add_header("Authorization", f"Bearer {self.token}")
+            try:
+                with urlopen(req, timeout=10) as resp:
+                    refreshed = json.loads(resp.read().decode()).get("token")
+                if refreshed:
+                    self.token = refreshed
+            except (HTTPError, OSError, ValueError):
+                pass
+        return self.token
+
+    def identity_for_user(self, user_id: str, permission: str = "read", ttl_seconds: int = 300) -> str:
+        """Ask core for a short-lived identity token for an existing user, so
+        the app's background work can act as that user. Only core's system
+        token may ask; core grants at most write, never more than the user's
+        own permission, caps the lifetime at 15 minutes and audit-logs it."""
+        resp = self._do("POST", "/api/auth/identity/for-user", {"user_id": user_id, "permission": permission, "ttl_seconds": ttl_seconds})
+        return resp.get("token", "")
 
     # ── Databases ──────────────────────────────────────────────
 
@@ -253,8 +289,9 @@ class LocalitasClient:
         """Ingest DogStatsD-format metric lines (text/plain). Returns accepted count."""
         url = self.base_url + "/apps/tsdb/api/ingest"
         req = Request(url, data=lines.encode(), method="POST")
-        if self.token:
-            req.add_header("Authorization", f"Bearer {self.token}")
+        bearer = self._bearer()
+        if bearer:
+            req.add_header("Authorization", f"Bearer {bearer}")
         req.add_header("Content-Type", "text/plain")
         try:
             with urlopen(req, timeout=30) as resp:
@@ -307,8 +344,9 @@ class LocalitasClient:
             data = json.dumps(body).encode()
 
         req = Request(url, data=data, method=method)
-        if self.token:
-            req.add_header("Authorization", f"Bearer {self.token}")
+        bearer = self._bearer()
+        if bearer:
+            req.add_header("Authorization", f"Bearer {bearer}")
         if data is not None:
             req.add_header("Content-Type", "application/json")
 
