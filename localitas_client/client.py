@@ -885,6 +885,17 @@ class PubSubRef:
         """Delete channel and all messages."""
         self._cache._client._cache_do("DELETE", self._base)
 
+    def info(self) -> dict:
+        """Describe the channel on the node asked: name, message_count,
+        last_message_at and last_seq (all zero for an empty channel)."""
+        return self._cache._client._cache_do("GET", self._base)
+
+    def last_seq(self) -> int:
+        """The newest message's sequence number on the node asked. Note it
+        before starting something whose outcome is published here, then
+        ``PubSubWS.watch`` after it, and the outcome cannot be missed."""
+        return self.info().get("last_seq", 0)
+
 
 class AutomationClient:
     """Client for automation run management and async job signaling."""
@@ -1041,9 +1052,34 @@ class PubSubWS:
             consumer: Consumer ID for cursor tracking.
             callback: Called with dict containing seq, value, channel.
         """
+        self._start(channel, {"consumer": consumer, "callback": callback})
+
+    def watch(self, channel: str, after_seq: int, callback):
+        """Call ``callback`` with each message published to ``channel`` after
+        ``after_seq``, as the server's node applies it. A watch keeps no cursor
+        and asks the cluster for nothing. To miss nothing a later action
+        publishes, note ``PubSubRef.last_seq()`` before the action and watch
+        after it. A reconnect resumes after the last message delivered."""
+        self._start(channel, {"callback": callback, "watch": True,
+                              "after": after_seq, "from_latest": False})
+
+    def watch_latest(self, channel: str, callback):
+        """``watch`` from the channel's newest message when the watch starts."""
+        self._start(channel, {"callback": callback, "watch": True,
+                              "after": 0, "from_latest": True})
+
+    def _start(self, channel: str, sub: dict):
         with self._lock:
-            self._subscriptions[channel] = {"consumer": consumer, "callback": callback}
-        self._send({"action": "subscribe", "channel": channel, "consumer": consumer})
+            self._subscriptions[channel] = sub
+        self._send(self._request(channel, sub))
+
+    @staticmethod
+    def _request(channel: str, sub: dict) -> dict:
+        if not sub.get("watch"):
+            return {"action": "subscribe", "channel": channel, "consumer": sub["consumer"]}
+        if sub["from_latest"]:
+            return {"action": "watch", "channel": channel, "from_latest": True}
+        return {"action": "watch", "channel": channel, "seq": sub["after"]}
 
     def unsubscribe(self, channel: str):
         """Unsubscribe from a channel."""
@@ -1089,18 +1125,30 @@ class PubSubWS:
         with self._lock:
             subs = dict(self._subscriptions)
         for channel, sub in subs.items():
-            self._send({"action": "subscribe", "channel": channel,
-                         "consumer": sub["consumer"]})
+            self._send(self._request(channel, sub))
 
     def _on_message(self, ws, message: str):
         try:
             msg = json.loads(message)
         except json.JSONDecodeError:
             return
-        self._emit(msg.get("type", ""), msg)
+        # The server's greeting is the socket opening, already emitted as
+        # "connected": a second one would run connect handlers twice.
+        if msg.get("type") != "connected":
+            self._emit(msg.get("type", ""), msg)
+        if msg.get("type") == "subscribed" and msg.get("channel"):
+            with self._lock:
+                sub = self._subscriptions.get(msg["channel"])
+                if sub and sub.get("watch") and sub["from_latest"]:
+                    sub["after"], sub["from_latest"] = msg.get("seq", 0), False
         if msg.get("type") == "message" and msg.get("channel"):
             with self._lock:
                 sub = self._subscriptions.get(msg["channel"])
+                if sub and sub.get("watch"):
+                    # A resumed watch may resend what came before the drop.
+                    if msg.get("seq", 0) <= sub["after"]:
+                        return
+                    sub["after"] = msg.get("seq", 0)
             if sub and sub.get("callback"):
                 sub["callback"]({"seq": msg.get("seq"), "value": msg.get("value"),
                                   "channel": msg["channel"]})
