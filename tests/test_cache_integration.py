@@ -348,19 +348,22 @@ class TestCacheWatch(unittest.TestCase):
 
     def test_watch_after_the_noted_last_seq(self):
         import queue
+        # Numbers come from the cluster's log: they only increase.
         self.channel.publish("a")
-        self.channel.publish("b")
+        b = self.channel.publish("b")
         noted = self.channel.last_seq()
-        self.assertEqual(noted, 2)
-        self.channel.publish("c")
+        self.assertEqual(noted, b)
+        c = self.channel.publish("c")
 
         got = queue.Queue()
         self._ws().watch("events", noted, got.put)
         first = got.get(timeout=10)
-        self.assertEqual((first["seq"], first["value"]), (3, "c"))
-        self.channel.publish("d")
+        self.assertEqual((first["seq"], first["value"]), (c, "c"))
+        d = self.channel.publish("d")
         second = got.get(timeout=10)
-        self.assertEqual((second["seq"], second["value"]), (4, "d"))
+        self.assertEqual((second["seq"], second["value"]), (d, "d"))
+        self.assertLess(noted, c)
+        self.assertLess(c, d)
 
     def test_watch_latest_sees_only_what_comes_next(self):
         import queue
@@ -374,9 +377,9 @@ class TestCacheWatch(unittest.TestCase):
         ws.on("subscribed", lambda _msg: started.set())
         ws.watch_latest("events", got.put)
         self.assertTrue(started.wait(10), "the watch never started")
-        self.channel.publish("new")
+        new = self.channel.publish("new")
         msg = got.get(timeout=10)
-        self.assertEqual((msg["seq"], msg["value"]), (4, "new"))
+        self.assertEqual((msg["seq"], msg["value"]), (new, "new"))
         time.sleep(0.2)
         self.assertTrue(got.empty(), "the watch delivered more than what came next")
 

@@ -945,33 +945,39 @@ class AutomationClient:
         return True
 
     def wait_for_run(self, run_id: str, timeout: float = 3600) -> dict:
-        """Wait for a run to complete via WebSocket pubsub. Returns the completed run."""
+        """Return the run once it has finished, without polling it.
+
+        Every finished run is announced once on the completions channel,
+        after its outcome is recorded. This notes the channel's last message,
+        then reads the run; the read is linearizable, so a run whose
+        completion is at or before the noted message is read finished. A run
+        still going is waited for by watching the channel after the noted
+        message: its completion comes after it, so it cannot be missed.
+        """
         import threading
+
+        noted = self._client.cache("localitas_automations").pubsub("completions").last_seq()
+        run = self.get_run(run_id)
+        if run.get("status") not in ("running", "pending"):
+            return run
 
         ws_url = self._client.base_url.replace("http://", "ws://").replace("https://", "wss://")
         ws_url += "/apps/cache/ws/localitas_automations"
-
-        result_holder = [None]
-        event = threading.Event()
-
-        ps = PubSubWS(ws_url, self._client.token)
-        consumer_id = f"sdk-wait-{run_id}-{int(time.time()*1000)}"
+        finished = threading.Event()
 
         def on_msg(msg):
             try:
-                payload = json.loads(msg.get("value", "{}"))
-                if payload.get("run_id") == run_id:
-                    result_holder[0] = self.get_run(run_id)
-                    event.set()
-            except Exception:
+                if json.loads(msg.get("value") or "{}").get("run_id") == run_id:
+                    finished.set()
+            except (ValueError, AttributeError):
                 pass
 
-        ps.subscribe("completions", consumer_id, on_msg)
-
+        ps = PubSubWS(ws_url, self._client.token)
         try:
-            if event.wait(timeout=timeout):
-                return result_holder[0]
-            raise TimeoutError(f"Timeout waiting for run {run_id}")
+            ps.watch("completions", noted, on_msg)
+            if not finished.wait(timeout=timeout):
+                raise TimeoutError(f"Timeout waiting for run {run_id}")
+            return self.get_run(run_id)
         finally:
             ps.close()
 
