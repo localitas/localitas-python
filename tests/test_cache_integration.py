@@ -327,5 +327,59 @@ class TestCacheWebSocket(unittest.TestCase):
         ws.close()
 
 
+class TestCacheWatch(unittest.TestCase):
+    """Watches through the client's PubSubWS: no cursor, nothing proposed,
+    only what is published after the point watched from."""
+
+    def setUp(self):
+        self.client = make_client()
+        self.cache_name = unique_name("watch")
+        self.client.create_cache(self.cache_name)
+        self.channel = self.client.cache(self.cache_name).pubsub("events", 0, 0)
+
+    def tearDown(self):
+        self.client.delete_cache(self.cache_name)
+
+    def _ws(self):
+        from localitas_client.client import PubSubWS
+        ws = PubSubWS(f"ws://localhost:9090/apps/cache/ws/{self.cache_name}", token=INTEG_TOKEN)
+        self.addCleanup(ws.close)
+        return ws
+
+    def test_watch_after_the_noted_last_seq(self):
+        import queue
+        self.channel.publish("a")
+        self.channel.publish("b")
+        noted = self.channel.last_seq()
+        self.assertEqual(noted, 2)
+        self.channel.publish("c")
+
+        got = queue.Queue()
+        self._ws().watch("events", noted, got.put)
+        first = got.get(timeout=10)
+        self.assertEqual((first["seq"], first["value"]), (3, "c"))
+        self.channel.publish("d")
+        second = got.get(timeout=10)
+        self.assertEqual((second["seq"], second["value"]), (4, "d"))
+
+    def test_watch_latest_sees_only_what_comes_next(self):
+        import queue
+        import threading
+        for v in ("old1", "old2", "old3"):
+            self.channel.publish(v)
+
+        got = queue.Queue()
+        started = threading.Event()
+        ws = self._ws()
+        ws.on("subscribed", lambda _msg: started.set())
+        ws.watch_latest("events", got.put)
+        self.assertTrue(started.wait(10), "the watch never started")
+        self.channel.publish("new")
+        msg = got.get(timeout=10)
+        self.assertEqual((msg["seq"], msg["value"]), (4, "new"))
+        time.sleep(0.2)
+        self.assertTrue(got.empty(), "the watch delivered more than what came next")
+
+
 if __name__ == "__main__":
     unittest.main()
