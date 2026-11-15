@@ -176,11 +176,19 @@ class LocalitasClient:
         result = self.sql_query(db["id"], "SELECT name, url, updated_at FROM services ORDER BY name")
         return [{"name": r[0], "url": r[1]} for r in result.get("rows", [])]
 
-    def register_external_app(self, name: str, display_name: str, url: str, icon: str = "") -> None:
-        """Register this app into the platform app registry (app selector UI)."""
-        self._do("POST", "/apps/ext", {
-            "name": name, "display_name": display_name, "url": url, "icon": icon,
-        })
+    def announce(self, port: int) -> "Announcement":
+        """Register the app listening on port with core, so core proxies to it
+        and runs its jobs. The app tells core only where it is
+        (http://localhost:<port>); core reads the rest from its health.json,
+        cron.json and public-paths.json. Returns at once and keeps trying in
+        a background thread until core takes the app, since core reads the
+        app while registering it: call it before serving. Call withdraw() on
+        shutdown.
+
+        In a container it does nothing: core registers app containers itself
+        when Docker reports them healthy, and only core knows the port it
+        published."""
+        return Announcement(self, port)
 
     # ── Permissions ────────────────────────────────────────────
 
@@ -365,6 +373,70 @@ class LocalitasClient:
         if not isinstance(resp, dict) or "result" not in resp:
             raise ValueError(f"{method} {path}: response has no result envelope: {resp!r}")
         return resp["result"]
+
+
+_ANNOUNCE_RETRY_FIRST = 1.0
+_ANNOUNCE_RETRY_MAX = 30.0
+
+
+def _in_container() -> bool:
+    if Path("/.dockerenv").exists():
+        return True
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text()
+    except OSError:
+        return False
+    return any(k in cgroup for k in ("docker", "containerd", "kubepods"))
+
+
+class Announcement:
+    """An app's registration with core, made by LocalitasClient.announce."""
+
+    def __init__(self, client: LocalitasClient, port: int):
+        import threading
+
+        self._client = client
+        self._url = f"http://localhost:{port}"
+        self._stop = threading.Event()
+        self._name = ""
+        self._thread = None
+        if _in_container():
+            return
+        self._thread = threading.Thread(target=self._run, name="localitas-announce", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        import logging
+
+        wait = _ANNOUNCE_RETRY_FIRST
+        while not self._stop.is_set():
+            try:
+                app = self._client._do("POST", "/apps/ext", {"url": self._url}) or {}
+                self._name = app.get("name", "")
+                logging.getLogger("localitas").info("announced %s at %s", self._name, self._url)
+                return
+            except (APIError, OSError, ValueError) as e:
+                logging.getLogger("localitas").warning(
+                    "core has not taken the app at %s yet; trying again in %.0fs: %s", self._url, wait, e)
+            if self._stop.wait(wait):
+                return
+            wait = min(2 * wait, _ANNOUNCE_RETRY_MAX)
+
+    @property
+    def name(self) -> str:
+        """The app core registered, or "" while core has not taken it."""
+        if self._thread is not None and self._thread.is_alive():
+            return ""
+        return self._name
+
+    def withdraw(self) -> None:
+        """Stop announcing and take the app out of core, if core had taken it."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+        if self._name:
+            self._client._do("DELETE", f"/apps/ext/{_esc(self._name)}")
+            self._name = ""
 
 
 def _esc(s: str) -> str:
