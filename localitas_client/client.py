@@ -444,9 +444,18 @@ class CacheRef:
 
     def get(self, key: str) -> Optional[str]:
         """Get a key's value. Returns None on miss."""
+        return self._get(f"{self._base}/keys/{_esc(key)}")
+
+    def get_consistent(self, key: str) -> Optional[str]:
+        """``get`` that sees every write committed before it, through whichever
+        node it entered: a plain read answers from that node's own copy, which
+        may not yet hold a write made through another node a moment ago. Use
+        it where a stale value is wrong, such as a count of failed logons."""
+        return self._get(f"{self._base}/keys/{_esc(key)}?consistent=true")
+
+    def _get(self, path: str) -> Optional[str]:
         try:
-            result = self._client._cache_do("GET", f"{self._base}/keys/{_esc(key)}")
-            return result.get("value")
+            return self._client._cache_do("GET", path).get("value")
         except APIError as e:
             if _is_miss(e):
                 return None
@@ -455,6 +464,33 @@ class CacheRef:
     def set(self, key: str, value: str, ttl: int = 0) -> None:
         """Set a key with optional TTL in seconds. TTL 0 = no expiry."""
         self._client._cache_do("PUT", f"{self._base}/keys/{_esc(key)}", {"value": value, "ttl": ttl})
+
+    def ttl(self, key: str) -> int:
+        """Remaining time-to-live in seconds: -1 if the key has no expiry, -2
+        if it doesn't exist or has expired. An unknown cache raises."""
+        try:
+            result = self._client._cache_do("GET", f"{self._base}/keys/{_esc(key)}")
+            return result.get("ttl_remaining", 0)
+        except APIError as e:
+            if _is_miss(e):
+                return -2
+            raise
+
+    def expire(self, key: str, ttl: int) -> bool:
+        """Set or update the TTL (seconds) of an existing key. Returns False
+        if the key doesn't exist; a non-positive ttl raises (400)."""
+        try:
+            self._client._cache_do("POST", f"{self._base}/keys/expire/{_esc(key)}", {"ttl": ttl})
+            return True
+        except APIError as e:
+            if _is_miss(e):
+                return False
+            raise
+
+    def get_set(self, key: str, value: str, ttl: int = 0) -> Optional[str]:
+        """Atomically set a key and return its old value, or None if it had none."""
+        result = self._client._cache_do("POST", f"{self._base}/keys/getset/{_esc(key)}", {"value": value, "ttl": ttl})
+        return result.get("old_value") if result.get("had_old") else None
 
     def delete(self, key: str) -> None:
         """Delete a key."""
@@ -576,6 +612,11 @@ class ListRef:
         r = self._cache._client._cache_do("GET", f"{self._base}?start={start}&stop={stop}")
         return r.get("values", [])
 
+    def len(self) -> int:
+        """Return the length of the list."""
+        r = self._cache._client._cache_do("GET", f"{self._base}?start=0&stop=-1")
+        return r.get("length", 0)
+
     def delete(self) -> None:
         """Delete the entire list."""
         self._cache._client._cache_do("DELETE", self._base)
@@ -660,6 +701,14 @@ class HashRef:
         """Populate hash from JSON object string."""
         self._cache._client._cache_do("PUT", f"{self._base}/json", {"json": json_str})
 
+    def delete_fields(self, *fields: str) -> int:
+        """Remove fields from the hash. Returns the number removed."""
+        removed = 0
+        for field in fields:
+            r = self._cache._client._cache_do("DELETE", f"{self._base}/fields/{_esc(field)}")
+            removed += r.get("removed", 0)
+        return removed
+
     def delete(self) -> None:
         """Delete the entire hash."""
         self._cache._client._cache_do("DELETE", self._base)
@@ -713,6 +762,12 @@ class SortedSetRef:
     def range(self, start: int = 0, stop: int = -1) -> list[dict]:
         """Return entries by rank range. Each: {"member": str, "score": float}."""
         r = self._cache._client._cache_do("GET", f"{self._base}?start={start}&stop={stop}")
+        return r.get("entries", [])
+
+    def range_by_score(self, min_score: float, max_score: float) -> list[dict]:
+        """Return entries with scores between min_score and max_score (inclusive)."""
+        query = urllib.parse.urlencode({"min": min_score, "max": max_score})
+        r = self._cache._client._cache_do("GET", f"{self._base}/byscore?{query}")
         return r.get("entries", [])
 
     def rem(self, *members: str) -> int:
@@ -881,6 +936,20 @@ class PubSubRef:
         self._cache._client._cache_do("POST",
             f"{self._base}/group/{_esc(group_name)}/ack", {"seq": seq})
 
+    def reclaim(self, group_name: str, consumer_id: str, timeout: int = 30) -> list[dict]:
+        """Re-assign to consumer_id the group's messages pending longer than
+        timeout seconds without an ack, and return them."""
+        query = urllib.parse.urlencode({"consumer": consumer_id, "timeout": timeout})
+        r = self._cache._client._cache_do("POST",
+            f"{self._base}/group/{_esc(group_name)}/reclaim?{query}")
+        return r.get("messages", [])
+
+    def trim(self, max_age_seconds: int) -> int:
+        """Remove messages older than max_age_seconds. Returns the number
+        removed; a non-positive age raises (400)."""
+        r = self._cache._client._cache_do("POST", f"{self._base}/trim", {"max_age": max_age_seconds})
+        return r.get("removed", 0)
+
     def delete(self) -> None:
         """Delete channel and all messages."""
         self._cache._client._cache_do("DELETE", self._base)
@@ -1003,12 +1072,14 @@ class PubSubWS:
 
     def __init__(self, url: str, token: str = "",
                  reconnect_interval: float = 2.0,
-                 max_reconnect_interval: float = 30.0):
+                 max_reconnect_interval: float = 30.0,
+                 batch_size: int = 50):
         import threading
         self._url = url
         self._token = token
         self._reconnect_interval = reconnect_interval
         self._max_reconnect_interval = max_reconnect_interval
+        self._batch_size = batch_size
         self._ws = None
         self._subscriptions: dict[str, dict] = {}
         self._listeners: dict[str, list] = {}
@@ -1079,13 +1150,13 @@ class PubSubWS:
             self._subscriptions[channel] = sub
         self._send(self._request(channel, sub))
 
-    @staticmethod
-    def _request(channel: str, sub: dict) -> dict:
+    def _request(self, channel: str, sub: dict) -> dict:
+        count = self._batch_size
         if not sub.get("watch"):
-            return {"action": "subscribe", "channel": channel, "consumer": sub["consumer"]}
+            return {"action": "subscribe", "channel": channel, "consumer": sub["consumer"], "count": count}
         if sub["from_latest"]:
-            return {"action": "watch", "channel": channel, "from_latest": True}
-        return {"action": "watch", "channel": channel, "seq": sub["after"]}
+            return {"action": "watch", "channel": channel, "from_latest": True, "count": count}
+        return {"action": "watch", "channel": channel, "seq": sub["after"], "count": count}
 
     def unsubscribe(self, channel: str):
         """Unsubscribe from a channel."""

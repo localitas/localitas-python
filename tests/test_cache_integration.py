@@ -7,6 +7,7 @@ import time
 import unittest
 
 from localitas_client import LocalitasClient
+from localitas_client.client import APIError
 
 INTEG_URL = "http://localhost:9090"
 # The integration cluster's seeded API token for alice@test.local
@@ -77,6 +78,34 @@ class TestCacheKV(unittest.TestCase):
         self.assertGreaterEqual(stats["hits"], 1)
         self.assertGreaterEqual(stats["misses"], 1)
 
+    def test_get_consistent(self):
+        self.cache.set("k", "v")
+        self.assertEqual(self.cache.get_consistent("k"), "v")
+        self.assertIsNone(self.cache.get_consistent("absent"))
+
+    def test_ttl_and_expire(self):
+        self.cache.set("forever", "v")
+        self.assertEqual(self.cache.ttl("forever"), -1)
+        self.assertTrue(self.cache.expire("forever", 300))
+        self.assertTrue(0 < self.cache.ttl("forever") <= 300)
+        self.assertEqual(self.cache.ttl("absent"), -2)
+        self.assertFalse(self.cache.expire("absent", 300))
+        with self.assertRaises(APIError) as ctx:
+            self.cache.expire("forever", 0)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_get_set(self):
+        self.assertIsNone(self.cache.get_set("lock", "owner-a"))
+        self.assertEqual(self.cache.get_set("lock", "owner-b", ttl=60), "owner-a")
+        self.assertEqual(self.cache.get("lock"), "owner-b")
+
+    def test_unknown_cache_is_an_error_not_a_miss(self):
+        gone = self.client.cache(unique_name("gone"))
+        for call in (lambda: gone.get("k"), lambda: gone.ttl("k"), lambda: gone.expire("k", 10)):
+            with self.assertRaises(APIError) as ctx:
+                call()
+            self.assertEqual(ctx.exception.status_code, 404)
+
 
 class TestCacheList(unittest.TestCase):
     def setUp(self):
@@ -104,6 +133,12 @@ class TestCacheList(unittest.TestCase):
     def test_empty_pop(self):
         lst = self.cache.list("empty")
         self.assertIsNone(lst.lpop())
+
+    def test_len(self):
+        lst = self.cache.list("q")
+        self.assertEqual(lst.len(), 0)
+        lst.rpush("a", "b", "c")
+        self.assertEqual(lst.len(), 3)
 
 
 class TestCacheSet(unittest.TestCase):
@@ -159,6 +194,12 @@ class TestCacheHash(unittest.TestCase):
         h.from_json('{"city": "NYC", "age": "30"}')
         self.assertEqual(h.get("city"), "NYC")
 
+    def test_delete_fields(self):
+        h = self.cache.hash("user")
+        h.set({"name": "Alice", "email": "alice@test.com", "city": "NYC"})
+        self.assertEqual(h.delete_fields("email", "city", "missing"), 2)
+        self.assertEqual(h.get_all(), {"name": "Alice"})
+
 
 class TestCacheSortedSet(unittest.TestCase):
     def setUp(self):
@@ -188,6 +229,13 @@ class TestCacheSortedSet(unittest.TestCase):
         lb.add(("alice", 100))
         new_score = lb.incr_by("alice", 50)
         self.assertEqual(new_score, 150)
+
+    def test_range_by_score(self):
+        lb = self.cache.sorted_set("lb")
+        lb.add(("alice", 100), ("bob", 200), ("charlie", 50), ("dave", 150.5))
+        entries = lb.range_by_score(100, 150.5)
+        self.assertEqual([e["member"] for e in entries], ["alice", "dave"])
+        self.assertEqual(lb.range_by_score(1000, 2000), [])
 
 
 class TestCacheQueue(unittest.TestCase):
@@ -275,6 +323,28 @@ class TestCachePubSub(unittest.TestCase):
         self.assertEqual(msg["value"], "job1")
 
         ch.ack("workers", msg["seq"])
+
+    def test_reclaim(self):
+        ch = self.cache.pubsub("jobs")
+        ch.create_group("workers")
+        ch.publish("job1")
+        msg = ch.claim("workers", "w1")
+        self.assertEqual(ch.reclaim("workers", "w2", timeout=60), [])
+        # Claims are stamped in whole seconds; a zero timeout reclaims one
+        # made in an earlier second.
+        time.sleep(1.1)
+        reclaimed = ch.reclaim("workers", "w2", timeout=0)
+        self.assertEqual([(m["seq"], m["value"]) for m in reclaimed], [(msg["seq"], "job1")])
+
+    def test_trim(self):
+        ch = self.cache.pubsub("events")
+        ch.publish("a")
+        ch.publish("b")
+        self.assertEqual(ch.trim(3600), 0)
+        self.assertEqual(ch.info()["message_count"], 2)
+        with self.assertRaises(APIError) as ctx:
+            ch.trim(0)
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 class TestCacheWebSocket(unittest.TestCase):
@@ -382,6 +452,18 @@ class TestCacheWatch(unittest.TestCase):
         self.assertEqual((msg["seq"], msg["value"]), (new, "new"))
         time.sleep(0.2)
         self.assertTrue(got.empty(), "the watch delivered more than what came next")
+
+    def test_subscribe_in_small_batches_delivers_the_whole_backlog(self):
+        import queue
+        from localitas_client.client import PubSubWS
+        seqs = [self.channel.publish(f"m{i}") for i in range(5)]
+
+        got = queue.Queue()
+        ws = PubSubWS(f"ws://localhost:9090/apps/cache/ws/{self.cache_name}", token=INTEG_TOKEN, batch_size=2)
+        self.addCleanup(ws.close)
+        ws.subscribe("events", "batched", got.put)
+        delivered = [got.get(timeout=10)["seq"] for _ in seqs]
+        self.assertEqual(delivered, seqs)
 
 
 if __name__ == "__main__":
