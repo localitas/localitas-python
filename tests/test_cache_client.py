@@ -163,6 +163,80 @@ class TestCacheKV(CacheClientTestCase):
         with self.assertRaises(ValueError):
             self.cache.get("k")
 
+    def test_get_consistent_asks_for_a_consistent_read(self):
+        self.route("GET", f"{BASE}/keys/k1", ok({"key": "k1", "value": "v1", "ttl_remaining": -1}))
+        self.assertEqual(self.cache.get_consistent("k1"), "v1")
+        self.assertEqual(self.last()["query"], "consistent=true")
+        self.cache.get("k1")
+        self.assertEqual(self.last()["query"], "")
+
+    def test_get_consistent_miss_is_none_and_failures_raise(self):
+        self.route("GET", f"{BASE}/keys/absent", miss("key not found"))
+        self.route("GET", f"{BASE}/keys/k", UNKNOWN_CACHE)
+        self.route("GET", f"{BASE}/keys/busy", err(503, "consistent read: raft: not ready"))
+        self.assertIsNone(self.cache.get_consistent("absent"))
+        with self.assertRaises(APIError) as ctx:
+            self.cache.get_consistent("k")
+        self.assert_status(ctx, 404)
+        with self.assertRaises(APIError) as ctx:
+            self.cache.get_consistent("busy")
+        self.assert_status(ctx, 503)
+
+    def test_ttl_reads_the_remaining_seconds(self):
+        self.route("GET", f"{BASE}/keys/forever", ok({"key": "forever", "value": "v", "ttl_remaining": -1}))
+        self.route("GET", f"{BASE}/keys/soon", ok({"key": "soon", "value": "v", "ttl_remaining": 42}))
+        self.route("GET", f"{BASE}/keys/absent", miss("key not found"))
+        self.assertEqual(self.cache.ttl("forever"), -1)
+        self.assertEqual(self.cache.ttl("soon"), 42)
+        self.assertEqual(self.cache.ttl("absent"), -2)
+        self.assertEqual(len(_CoreCacheFake.calls), 3)
+
+    def test_ttl_failures_raise(self):
+        self.route("GET", f"{BASE}/keys/k", UNKNOWN_CACHE)
+        self.route("GET", f"{BASE}/keys/busy", err(500, "database is locked"))
+        with self.assertRaises(APIError) as ctx:
+            self.cache.ttl("k")
+        self.assert_status(ctx, 404)
+        with self.assertRaises(APIError) as ctx:
+            self.cache.ttl("busy")
+        self.assert_status(ctx, 500)
+
+    def test_expire(self):
+        self.route("POST", f"{BASE}/keys/expire/a%2Fb", ok({"status": "ok"}))
+        self.route("POST", f"{BASE}/keys/expire/absent", miss("key not found"))
+        self.route("POST", f"{BASE}/keys/expire/k", err(400, "ttl is required and must be positive"))
+        self.assertTrue(self.cache.expire("a/b", 30))
+        self.assertEqual(json.loads(self.last()["body"]), {"ttl": 30})
+        self.assertFalse(self.cache.expire("absent", 30))
+        with self.assertRaises(APIError) as ctx:
+            self.cache.expire("k", 0)
+        self.assert_status(ctx, 400)
+
+    def test_expire_on_unknown_cache_raises(self):
+        self.route("POST", f"{BASE}/keys/expire/k", UNKNOWN_CACHE)
+        with self.assertRaises(APIError) as ctx:
+            self.cache.expire("k", 30)
+        self.assert_status(ctx, 404)
+
+    def test_get_set_returns_the_old_value(self):
+        self.route("POST", f"{BASE}/keys/getset/lock", ok({"had_old": True, "key": "lock", "old_value": "owner-a"}))
+        self.route("POST", f"{BASE}/keys/getset/empty", ok({"had_old": True, "key": "empty", "old_value": ""}))
+        self.route("POST", f"{BASE}/keys/getset/new", ok({"had_old": False, "key": "new", "old_value": ""}))
+        self.assertEqual(self.cache.get_set("lock", "owner-c", ttl=60), "owner-a")
+        self.assertEqual(json.loads(self.last()["body"]), {"value": "owner-c", "ttl": 60})
+        self.assertEqual(self.cache.get_set("empty", "x"), "")
+        self.assertIsNone(self.cache.get_set("new", "x"))
+
+    def test_get_set_failures_raise(self):
+        self.route("POST", f"{BASE}/keys/getset/k", UNKNOWN_CACHE)
+        self.route("POST", f"{BASE}/keys/getset/busy", err(500, "database is locked"))
+        with self.assertRaises(APIError) as ctx:
+            self.cache.get_set("k", "v")
+        self.assert_status(ctx, 404)
+        with self.assertRaises(APIError) as ctx:
+            self.cache.get_set("busy", "v")
+        self.assert_status(ctx, 500)
+
 
 class TestCacheManagement(CacheClientTestCase):
     def test_list_caches_unwraps_the_result(self):
@@ -311,6 +385,87 @@ class TestCacheStructures(CacheClientTestCase):
         with self.assertRaises(APIError) as ctx:
             ch.claim("nope", "w1")
         self.assert_status(ctx, 404)
+
+    def test_list_len(self):
+        self.route("GET", f"{BASE}/lists/jobs", ok({"length": 3, "values": ["a", "b", "c"]}))
+        self.route("GET", f"{BASE}/lists/gone", UNKNOWN_CACHE)
+        self.assertEqual(self.cache.list("jobs").len(), 3)
+        self.assertEqual(self.last()["query"], "start=0&stop=-1")
+        with self.assertRaises(APIError) as ctx:
+            self.cache.list("gone").len()
+        self.assert_status(ctx, 404)
+
+    def test_hash_delete_fields(self):
+        h = f"{BASE}/hashes/user%3A1"
+        self.route("DELETE", f"{h}/fields/name", ok({"removed": 1}))
+        self.route("DELETE", f"{h}/fields/a%2Fb", ok({"removed": 0}))
+        self.route("DELETE", f"{h}/fields/city", ok({"removed": 1}))
+        user = self.cache.hash("user:1")
+
+        self.assertEqual(user.delete_fields("name", "a/b", "city"), 2)
+        self.assertEqual([c["path"] for c in _CoreCacheFake.calls],
+                         [f"{h}/fields/name", f"{h}/fields/a%2Fb", f"{h}/fields/city"])
+        self.assertEqual(user.delete_fields(), 0)
+        self.assertEqual(len(_CoreCacheFake.calls), 3)
+
+    def test_hash_delete_fields_failures_raise(self):
+        self.route("DELETE", f"{BASE}/hashes/h/fields/a", UNKNOWN_CACHE)
+        self.route("DELETE", f"{BASE}/hashes/h/fields/b", err(500, "database is locked"))
+        with self.assertRaises(APIError) as ctx:
+            self.cache.hash("h").delete_fields("a")
+        self.assert_status(ctx, 404)
+        with self.assertRaises(APIError) as ctx:
+            self.cache.hash("h").delete_fields("b")
+        self.assert_status(ctx, 500)
+
+    def test_sorted_set_range_by_score(self):
+        z = f"{BASE}/zsets/board"
+        entries = [{"member": "bob", "score": 150}, {"member": "alice", "score": 200.5}]
+        self.route("GET", f"{z}/byscore", ok({"count": 2, "entries": entries}))
+        lb = self.cache.sorted_set("board")
+
+        self.assertEqual(lb.range_by_score(100, 200.5), entries)
+        self.assertEqual(urllib.parse.parse_qs(self.last()["query"]), {"min": ["100"], "max": ["200.5"]})
+
+    def test_sorted_set_range_by_score_failures_raise(self):
+        self.route("GET", f"{BASE}/zsets/board/byscore", err(500, "database is locked"))
+        self.route("GET", f"{BASE}/zsets/gone/byscore", UNKNOWN_CACHE)
+        with self.assertRaises(APIError) as ctx:
+            self.cache.sorted_set("board").range_by_score(0, 1)
+        self.assert_status(ctx, 500)
+        with self.assertRaises(APIError) as ctx:
+            self.cache.sorted_set("gone").range_by_score(0, 1)
+        self.assert_status(ctx, 404)
+
+    def test_pubsub_reclaim_and_trim(self):
+        ps = f"{BASE}/pubsub/events"
+        msgs = [{"seq": 2, "value": "job-1", "created_at": 102}]
+        self.route("POST", f"{ps}/group/workers/reclaim", ok({"count": 1, "messages": msgs}))
+        self.route("POST", f"{ps}/trim", ok({"removed": 4}))
+        ch = self.cache.pubsub("events")
+
+        self.assertEqual(ch.reclaim("workers", "worker 2", timeout=60), msgs)
+        self.assertEqual(urllib.parse.parse_qs(self.last()["query"]), {"consumer": ["worker 2"], "timeout": ["60"]})
+        ch.reclaim("workers", "w2")
+        self.assertEqual(urllib.parse.parse_qs(self.last()["query"])["timeout"], ["30"])
+        self.assertEqual(ch.trim(3600), 4)
+        self.assertEqual(json.loads(self.last()["body"]), {"max_age": 3600})
+
+    def test_pubsub_reclaim_and_trim_failures_raise(self):
+        ps = f"{BASE}/pubsub/events"
+        self.route("POST", f"{ps}/group/workers/reclaim", UNKNOWN_CACHE)
+        self.route("POST", f"{ps}/group/busy/reclaim", err(500, "database is locked"))
+        self.route("POST", f"{ps}/trim", err(400, "max_age or max_size required"))
+        ch = self.cache.pubsub("events")
+        with self.assertRaises(APIError) as ctx:
+            ch.reclaim("workers", "w2")
+        self.assert_status(ctx, 404)
+        with self.assertRaises(APIError) as ctx:
+            ch.reclaim("busy", "w2")
+        self.assert_status(ctx, 500)
+        with self.assertRaises(APIError) as ctx:
+            ch.trim(0)
+        self.assert_status(ctx, 400)
 
 
 if __name__ == "__main__":
