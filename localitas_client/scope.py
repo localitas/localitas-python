@@ -9,7 +9,6 @@ The scope hierarchy is: guest < read < write < admin.
 
 import base64
 import hashlib
-import hmac
 import json
 import os
 import time
@@ -34,17 +33,14 @@ def has_scope(user_scope: str, required: str) -> bool:
     return scope_rank(user_scope) >= scope_rank(required)
 
 
-_IDENTITY_KEY_DOMAIN = "localitas-internal-token-v1"
 _ED25519_KID_PREFIX = "ed25519-"
 _CLOCK_SKEW = 120
 _KEY_FETCH_RETRY = 30
+_REFUSED = "legacy identity tokens are no longer accepted"
 
-_identity_key = None  # legacy HMAC key
 _public_keys = None  # kid -> Ed25519 public key; None until resolved
 _last_fetch = 0.0
 _fetched_key = False
-_legacy_explicit = None
-_legacy_fetched = None
 
 
 def _b64url_decode(s: str) -> bytes:
@@ -81,42 +77,15 @@ def _parse_keys(keys) -> dict:
 def set_identity_public_keys(*keys: str) -> None:
     """Verify identity tokens with these Ed25519 public keys (base64url)
     instead of LOCALITAS_IDENTITY_PUBLIC_KEY or the key core serves."""
-    global _public_keys, _legacy_fetched
-    _public_keys, _legacy_fetched = _parse_keys(keys), None
+    global _public_keys
+    _public_keys = _parse_keys(keys)
 
 
 def reset_identity_public_keys() -> None:
     """Resolve the public keys again from LOCALITAS_IDENTITY_PUBLIC_KEY
     (comma-separated), or else from core's GET /api/auth/identity/public-key."""
-    global _public_keys, _last_fetch, _fetched_key, _legacy_fetched
-    _public_keys, _last_fetch, _fetched_key, _legacy_fetched = None, 0.0, False, None
-
-
-def set_accept_legacy_identity_tokens(accept: bool) -> None:
-    """Accept (or refuse) HMAC-signed tokens and tokens without an expiry,
-    instead of LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS or what core reports."""
-    global _legacy_explicit
-    _legacy_explicit = bool(accept)
-
-
-def reset_accept_legacy_identity_tokens() -> None:
-    global _legacy_explicit
-    _legacy_explicit = None
-
-
-def set_identity_key_from_api_token(api_token: str) -> None:
-    """Verify legacy identity tokens with the key core derives from its API
-    token. Apps normally need not call this: the key is derived from
-    LOCALITAS_API_TOKEN, or the token in ~/.localitas/config-core.yaml."""
-    global _identity_key
-    _identity_key = _derive_identity_key(api_token)
-
-
-def _derive_identity_key(api_token: str) -> bytes:
-    if not api_token:
-        return b""
-    digest = hashlib.sha256(f"{_IDENTITY_KEY_DOMAIN}:{api_token}".encode()).digest()
-    return base64.standard_b64encode(digest)
+    global _public_keys, _last_fetch, _fetched_key
+    _public_keys, _last_fetch, _fetched_key = None, 0.0, False
 
 
 def _system_token() -> str:
@@ -125,15 +94,8 @@ def _system_token() -> str:
     return os.environ.get("LOCALITAS_API_TOKEN") or default_token()
 
 
-def _current_identity_key() -> bytes:
-    global _identity_key
-    if _identity_key is None:
-        _identity_key = _derive_identity_key(_system_token())
-    return _identity_key
-
-
 def _fetch_public_key() -> None:
-    global _public_keys, _last_fetch, _fetched_key, _legacy_fetched
+    global _public_keys, _last_fetch, _fetched_key
     token = _system_token()
     if not token or time.time() - _last_fetch < _KEY_FETCH_RETRY:
         return
@@ -146,7 +108,6 @@ def _fetch_public_key() -> None:
     except Exception:
         return
     _fetched_key = True
-    _legacy_fetched = bool(body.get("accept_legacy"))
     if body.get("public_key"):
         try:
             _public_keys = _parse_keys([body["public_key"]])
@@ -154,8 +115,8 @@ def _fetch_public_key() -> None:
             pass
 
 
-def _resolve():
-    """The public keys and legacy policy to verify with."""
+def _resolve() -> dict:
+    """The public keys to verify with."""
     global _public_keys
     if _public_keys is None:
         env = os.environ.get("LOCALITAS_IDENTITY_PUBLIC_KEY", "")
@@ -166,17 +127,7 @@ def _resolve():
                 pass
         elif not _fetched_key:
             _fetch_public_key()
-    legacy = True
-    env = os.environ.get("LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS", "").lower()
-    if _legacy_explicit is not None:
-        legacy = _legacy_explicit
-    elif env in ("false", "0"):
-        legacy = False
-    elif env in ("true", "1"):
-        legacy = True
-    elif _legacy_fetched is not None:
-        legacy = _legacy_fetched
-    return _public_keys or {}, legacy
+    return _public_keys or {}
 
 
 def unverified_claims(token: str) -> dict:
@@ -196,9 +147,8 @@ def parse_bearer_token(token: str, now: float = None) -> dict:
     return its claims: ``user_id``, ``email``, ``name``, ``permission``,
     ``iat``, ``exp``. Raises ValueError for an unsigned, tampered or wrong-key
     token, and one expired (beyond two minutes of clock skew) or issued in
-    the future. Legacy tokens — HMAC-signed under the key derived from the API
-    token, or without an expiry — verify only while legacy tokens are
-    accepted."""
+    the future. Tokens not signed with an Ed25519 key (the old HMAC tokens)
+    and tokens without an expiry are always refused."""
     payload, sep, sig = token.partition(".")
     if not sep or not payload or not sig:
         raise ValueError("identity token is not signed")
@@ -209,33 +159,23 @@ def parse_bearer_token(token: str, now: float = None) -> dict:
     if not isinstance(claims, dict):
         raise ValueError("token payload is not an object")
 
-    keys, legacy = _resolve()
     kid = claims.get("kid") or ""
-    if kid.startswith(_ED25519_KID_PREFIX):
-        pub = keys.get(kid)
-        if pub is None:
-            raise ValueError("identity token signed with an unknown key" if keys else "no identity public key: set LOCALITAS_IDENTITY_PUBLIC_KEY")
-        try:
-            raw_sig = _b64url_decode(sig)
-        except ValueError as e:
-            raise ValueError("identity token signature does not verify") from e
-        if not _ed25519.verify(pub, payload.encode(), raw_sig):
-            raise ValueError("identity token signature does not verify")
-    else:
-        if not legacy:
-            raise ValueError("legacy identity tokens are no longer accepted")
-        key = _current_identity_key()
-        if not key:
-            raise ValueError("no identity key: set LOCALITAS_API_TOKEN")
-        expected = base64.urlsafe_b64encode(hmac.new(key, payload.encode(), hashlib.sha256).digest()).rstrip(b"=").decode()
-        if not hmac.compare_digest(sig, expected):
-            raise ValueError("identity token signature does not verify")
+    if not isinstance(kid, str) or not kid.startswith(_ED25519_KID_PREFIX):
+        raise ValueError(_REFUSED)
+    keys = _resolve()
+    pub = keys.get(kid)
+    if pub is None:
+        raise ValueError("identity token signed with an unknown key" if keys else "no identity public key: set LOCALITAS_IDENTITY_PUBLIC_KEY")
+    try:
+        raw_sig = _b64url_decode(sig)
+    except ValueError as e:
+        raise ValueError("identity token signature does not verify") from e
+    if not _ed25519.verify(pub, payload.encode(), raw_sig):
+        raise ValueError("identity token signature does not verify")
 
     exp = int(claims.get("exp") or 0)
     if not exp:
-        if not legacy:
-            raise ValueError("legacy identity tokens are no longer accepted")
-        return claims
+        raise ValueError(_REFUSED)
     current = time.time() if now is None else now
     if current > exp + _CLOCK_SKEW:
         raise ValueError("identity token expired")

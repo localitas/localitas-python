@@ -1,5 +1,5 @@
-"""Identity tokens: core's Ed25519 signature, expiry, the legacy policy, and
-clients refreshing the token they act with."""
+"""Identity tokens: core's Ed25519 signature, expiry, refusing legacy tokens,
+and clients refreshing the token they act with."""
 
 import base64
 import calendar
@@ -38,6 +38,8 @@ def sign_ed25519(seed, claims):
 
 
 def sign_hmac(api_token, claims):
+    """Sign claims exactly as core signed legacy identity tokens: the
+    base64url HMAC-SHA256 of the payload under base64std(sha256(domain:api_token))."""
     payload = b64(json.dumps(claims).encode())
     key = base64.standard_b64encode(hashlib.sha256(f"localitas-internal-token-v1:{api_token}".encode()).digest())
     return payload + "." + b64(hmac.new(key, payload.encode(), hashlib.sha256).digest())
@@ -71,15 +73,27 @@ def fresh(now, ttl=300):
     return {"user_id": "u1", "email": "alice@test.local", "permission": "write", "iat": now, "exp": now + ttl, "max": now + 86400}
 
 
+def legacy_tokens(now):
+    return {
+        "core's legacy golden token, no exp": LEGACY_GOLDEN_TOKEN,
+        "hmac with exp": sign_hmac(TEST_API_TOKEN, fresh(now)),
+        "hmac with kid hmac": sign_hmac(TEST_API_TOKEN, dict(fresh(now), kid="hmac")),
+    }
+
+
 class IdentityTestCase(unittest.TestCase):
     def setUp(self):
-        scope.set_identity_key_from_api_token(TEST_API_TOKEN)
         scope.set_identity_public_keys(GOLDEN_PUBLIC_KEY)
-        scope.reset_accept_legacy_identity_tokens()
 
     def tearDown(self):
         scope.set_identity_public_keys(GOLDEN_PUBLIC_KEY)
-        scope.reset_accept_legacy_identity_tokens()
+
+    def assertRefused(self, token, now):
+        with self.assertRaisesRegex(ValueError, "no longer accepted"):
+            scope.parse_bearer_token(token, now=now)
+        self.assertEqual(scope.identity_from_auth_header(f"Bearer {token}"), {})
+        with self.assertRaises(PermissionError):
+            scope.require_scope(f"Bearer {token}", scope.SCOPE_READ)
 
 
 class TestEd25519(unittest.TestCase):
@@ -107,24 +121,23 @@ class TestIdentityTokens(IdentityTestCase):
         with self.assertRaises(ValueError):
             scope.parse_bearer_token(sign_ed25519(bytes(32), fresh(T0)), now=T0)
 
-    def test_legacy_tokens_only_while_accepted(self):
-        with_exp = sign_hmac(TEST_API_TOKEN, fresh(T0))
-        scope.parse_bearer_token(LEGACY_GOLDEN_TOKEN, now=T0)
-        scope.parse_bearer_token(with_exp, now=T0)
-        scope.set_accept_legacy_identity_tokens(False)
-        for token in (LEGACY_GOLDEN_TOKEN, with_exp):
-            with self.assertRaisesRegex(ValueError, "legacy"):
-                scope.parse_bearer_token(token, now=T0)
-            self.assertEqual(scope.identity_from_auth_header(f"Bearer {token}"), {})
-        scope.parse_bearer_token(GOLDEN_TOKEN, now=T0)
-
-    def test_public_key_and_policy_from_environment(self):
-        with environment(LOCALITAS_IDENTITY_PUBLIC_KEY=GOLDEN_PUBLIC_KEY, LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS="false"):
-            scope.reset_identity_public_keys()
-            scope.reset_accept_legacy_identity_tokens()
+    def test_refuses_hmac_tokens_even_when_legacy_is_asked_for(self):
+        with environment(LOCALITAS_API_TOKEN=TEST_API_TOKEN, LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS="true"):
+            for name, token in legacy_tokens(T0).items():
+                with self.subTest(name):
+                    self.assertRefused(token, T0)
             scope.parse_bearer_token(GOLDEN_TOKEN, now=T0)
-            with self.assertRaisesRegex(ValueError, "legacy"):
-                scope.parse_bearer_token(LEGACY_GOLDEN_TOKEN, now=T0)
+
+    def test_refuses_an_ed25519_token_without_expiry(self):
+        no_exp = {"user_id": "u1", "email": "alice@test.local", "permission": "write", "iat": T0}
+        with environment(LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS="true"):
+            self.assertRefused(sign_ed25519(SEED, no_exp), T0)
+
+    def test_public_key_from_environment(self):
+        with environment(LOCALITAS_IDENTITY_PUBLIC_KEY=GOLDEN_PUBLIC_KEY, LOCALITAS_API_TOKEN=TEST_API_TOKEN, LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS="true"):
+            scope.reset_identity_public_keys()
+            scope.parse_bearer_token(GOLDEN_TOKEN, now=T0)
+            self.assertRefused(LEGACY_GOLDEN_TOKEN, T0)
 
 
 class _Core(BaseHTTPRequestHandler):
@@ -148,7 +161,7 @@ class _Core(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/auth/identity/public-key":
             _Core.asked_key_with.append(self.headers.get("Authorization"))
-            self._send({"alg": "EdDSA", "public_key": GOLDEN_PUBLIC_KEY, "accept_legacy": False})
+            self._send({"alg": "EdDSA", "public_key": GOLDEN_PUBLIC_KEY, "accept_legacy": True})
             return
         _Core.seen.append(self.headers.get("Authorization"))
         self._send([])
@@ -181,8 +194,14 @@ class TestWithCore(IdentityTestCase):
             scope.reset_identity_public_keys()
             scope.parse_bearer_token(GOLDEN_TOKEN, now=T0)
             self.assertEqual(_Core.asked_key_with, [f"Bearer {TEST_API_TOKEN}"])
-            with self.assertRaisesRegex(ValueError, "legacy"):
-                scope.parse_bearer_token(LEGACY_GOLDEN_TOKEN, now=T0)
+
+    def test_refuses_hmac_tokens_when_core_says_accept_legacy(self):
+        with environment(CORE_URL=self.url, LOCALITAS_API_TOKEN=TEST_API_TOKEN, LOCALITAS_IDENTITY_PUBLIC_KEY="", LOCALITAS_ACCEPT_LEGACY_IDENTITY_TOKENS=""):
+            scope.reset_identity_public_keys()
+            scope.parse_bearer_token(GOLDEN_TOKEN, now=T0)
+            for name, token in legacy_tokens(T0).items():
+                with self.subTest(name):
+                    self.assertRefused(token, T0)
 
     def test_client_refreshes_an_identity_token_near_expiry(self):
         original = sign_ed25519(SEED, fresh(T0))
