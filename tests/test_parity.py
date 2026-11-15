@@ -1,5 +1,5 @@
 """Unit tests for the parity additions: migrator, scope/auth, crypto,
-and the new client methods (vault writes, metrics, register_external_app)."""
+and the new client methods (vault writes, metrics)."""
 
 import base64
 import hashlib
@@ -202,18 +202,6 @@ class TestNewClientMethods(unittest.TestCase):
         _MockHandler.routes["POST /apps/tsdb/api/ingest"] = h
         n = self.client.ingest_metrics([{"name": "x", "value": 1.0}, {"name": "y", "value": 2.0}])
         self.assertEqual(n, 2)
-
-    def test_register_external_app(self):
-        captured = {}
-
-        def h(headers, raw):
-            captured["body"] = json.loads(raw)
-            return 200, None
-
-        _MockHandler.routes["POST /apps/ext"] = h
-        self.client.register_external_app("myapp", "My App", "http://localhost:9999", icon="star")
-        self.assertEqual(captured["body"]["name"], "myapp")
-        self.assertEqual(captured["body"]["display_name"], "My App")
 
     def test_run_async_returns_false_without_run_id(self):
         # No run id → handler should respond synchronously (returns False).
