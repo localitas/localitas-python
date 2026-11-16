@@ -1065,16 +1065,24 @@ class AutomationClient:
     def wait_for_run(self, run_id: str, timeout: float = 3600) -> dict:
         """Return the run once it has finished, without polling it.
 
-        Every finished run is announced once on the completions channel,
-        after its outcome is recorded. This notes the channel's last message,
-        then reads the run; the read is linearizable, so a run whose
-        completion is at or before the noted message is read finished. A run
-        still going is waited for by watching the channel after the noted
-        message: its completion comes after it, so it cannot be missed.
+        Every finished run is announced once, after its outcome is recorded,
+        on the channel its first read names (its owner's own completions
+        channel; only the owner can read the run, so the caller is the
+        owner), or on the shared "completions" channel of a core that names
+        none. This reads the run to learn the channel, notes the channel's
+        last message, then reads the run again; the read is linearizable, so
+        a run whose completion is at or before the noted message is read
+        finished. A run still going is waited for by watching the channel
+        after the noted message: its completion comes after it, so it cannot
+        be missed.
         """
         import threading
 
-        noted = self._client.cache("localitas_automations").pubsub("completions").last_seq()
+        run = self.get_run(run_id)
+        if run.get("status") not in ("running", "pending"):
+            return run
+        channel = run.get("completion_channel") or "completions"
+        noted = self._client.cache("localitas_automations").pubsub(channel).last_seq()
         run = self.get_run(run_id)
         if run.get("status") not in ("running", "pending"):
             return run
@@ -1092,7 +1100,7 @@ class AutomationClient:
 
         ps = PubSubWS(ws_url, self._client.token)
         try:
-            ps.watch("completions", noted, on_msg)
+            ps.watch(channel, noted, on_msg)
             if not finished.wait(timeout=timeout):
                 raise TimeoutError(f"Timeout waiting for run {run_id}")
             return self.get_run(run_id)
