@@ -153,29 +153,6 @@ class LocalitasClient:
             path += f"&database_id={_esc(database_id)}"
         return self._do("GET", path)
 
-    # ── Service Registry ───────────────────────────────────────
-
-    def register_service(self, name: str, url: str) -> None:
-        db = self.create_database("service_registry", system=True)
-        self.apply_migration(db["id"], "20260424-000000-000-init", "service registry table",
-            "CREATE TABLE IF NOT EXISTS services (name TEXT PRIMARY KEY, url TEXT NOT NULL, updated_at INTEGER NOT NULL)",
-            "DROP TABLE IF EXISTS services")
-        self.sql_exec(db["id"],
-            "INSERT INTO services (name, url, updated_at) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET url = excluded.url, updated_at = excluded.updated_at",
-            name, url, int(time.time()))
-
-    def discover_service(self, name: str) -> str:
-        db = self.create_database("service_registry", system=True)
-        result = self.sql_query(db["id"], "SELECT url FROM services WHERE name = ?", name)
-        if not result.get("rows"):
-            raise APIError("GET", f"/services/{name}", 404, f"service {name!r} not found")
-        return result["rows"][0][0]
-
-    def list_services(self) -> list[dict]:
-        db = self.create_database("service_registry", system=True)
-        result = self.sql_query(db["id"], "SELECT name, url, updated_at FROM services ORDER BY name")
-        return [{"name": r[0], "url": r[1]} for r in result.get("rows", [])]
-
     def announce(self, port: int) -> "Announcement":
         """Register the app listening on port with core, so core proxies to it
         and runs its jobs. The app tells core only where it is
