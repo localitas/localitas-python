@@ -1079,12 +1079,12 @@ class AutomationClient:
         import threading
 
         run = self.get_run(run_id)
-        if run.get("status") not in ("running", "pending"):
+        if run.get("status") in ("completed", "failed"):
             return run
         channel = run.get("completion_channel") or "completions"
         noted = self._client.cache("localitas_automations").pubsub(channel).last_seq()
         run = self.get_run(run_id)
-        if run.get("status") not in ("running", "pending"):
+        if run.get("status") in ("completed", "failed"):
             return run
 
         ws_url = self._client.base_url.replace("http://", "ws://").replace("https://", "wss://")
