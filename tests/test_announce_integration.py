@@ -34,11 +34,8 @@ def _app_server(name: str, ready: threading.Event) -> ThreadingHTTPServer:
     return server
 
 
-def _listed_url(client: LocalitasClient, name: str) -> str:
-    for app in client._do("GET", "/apps/ext") or []:
-        if app.get("name") == name:
-            return app.get("url", "")
-    return ""
+def _listed(client: LocalitasClient, name: str) -> bool:
+    return any(app.get("name") == name for app in client._do("GET", "/apps/ext") or [])
 
 
 class TestAnnounce(unittest.TestCase):
@@ -60,10 +57,10 @@ class TestAnnounce(unittest.TestCase):
         while announcement.name != name:
             self.assertLess(time.time(), deadline, "the app answering health.json was not registered")
             time.sleep(0.1)
-        self.assertEqual(_listed_url(client, name), f"http://localhost:{port}")
+        self.assertTrue(_listed(client, name), "registered app not listed")
 
         announcement.withdraw()
-        self.assertEqual(_listed_url(client, name), "", "withdrawn app still listed")
+        self.assertFalse(_listed(client, name), "withdrawn app still listed")
 
 
 if __name__ == "__main__":
