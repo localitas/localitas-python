@@ -1,6 +1,8 @@
 """PEP 249 (DB-API 2.0) compliant interface for Localitas databases."""
 
-from .client import LocalitasClient, APIError
+import threading
+
+from .client import LocalitasClient, APIError, core_url_from_env
 
 apilevel = "2.0"
 threadsafety = 1
@@ -34,17 +36,25 @@ def _is_read_query(sql: str) -> bool:
     return first_word in _READ_PREFIXES
 
 
-def connect(database: str, host: str = "localhost:8080", token: str = "") -> "Connection":
-    scheme = "http://" if not host.startswith("http") else ""
-    base_url = f"{scheme}{host}"
-    client = LocalitasClient(base_url, token=token)
-    return Connection(client, database)
+def connect(database: str, host: str = "", token: str = "") -> "Connection":
+    """Connect to a database by ID through core at ``host``, or else at
+    CORE_URL. Prefer ``LocalitasClient.default().db(name)``."""
+    if host:
+        base_url = host if host.startswith("http") else f"http://{host}"
+    else:
+        base_url = core_url_from_env()
+    return Connection(LocalitasClient(base_url, token=token), database)
 
 
 class Connection:
-    def __init__(self, client: LocalitasClient, database: str):
+    """A connection to one database, given by ID, or by ``name`` (the app's
+    system database of that name, as ``LocalitasClient.db`` makes it)."""
+
+    def __init__(self, client: LocalitasClient, database: str = "", *, name: str = ""):
         self._client = client
         self._database = database
+        self._name = name
+        self._resolve_lock = threading.Lock()
         self._closed = False
         self._autocommit = True
         self._pending: list[dict] = []
@@ -57,7 +67,21 @@ class Connection:
     @property
     def database(self) -> str:
         """The id of the database this connection is bound to."""
-        return self._database
+        return self._resolved()
+
+    def _resolved(self) -> str:
+        """The database ID, asked of core by name on first use and kept once
+        known; a failure is raised here and asked again next time."""
+        with self._resolve_lock:
+            if not self._database:
+                try:
+                    db = self._client.create_database(self._name, system=True) or {}
+                except APIError as e:
+                    raise OperationalError(str(e)) from e
+                if not db.get("id"):
+                    raise OperationalError(f"core answered no id for database {self._name!r}")
+                self._database = db["id"]
+            return self._database
 
     @property
     def autocommit(self) -> bool:
@@ -77,8 +101,9 @@ class Connection:
         self._check_closed()
         if not self._pending:
             return
+        database = self._resolved()
         try:
-            self._client.sql_transaction(self._database, self._pending)
+            self._client.sql_transaction(database, self._pending)
         except APIError as e:
             raise DatabaseError(str(e)) from e
         finally:
@@ -98,10 +123,11 @@ class Connection:
             raise InterfaceError("Connection is closed")
 
     def _exec_immediate(self, sql: str, args: list):
+        database = self._resolved()
         try:
             if _is_read_query(sql):
-                return self._client.sql_query(self._database, sql, *args)
-            return self._client.sql_exec(self._database, sql, *args)
+                return self._client.sql_query(database, sql, *args)
+            return self._client.sql_exec(database, sql, *args)
         except APIError as e:
             raise DatabaseError(str(e)) from e
 

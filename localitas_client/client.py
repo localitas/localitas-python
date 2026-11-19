@@ -1,12 +1,19 @@
 """Localitas Python SDK — mirrors the Go client at /client/client.go."""
 
 import json
+import os
+import re
 import time
 import urllib.parse
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+
+if TYPE_CHECKING:
+    from .automation import CreateAutomationRequest
+    from .dbapi import Connection
 
 # Header the platform sets on automation-triggered HTTP calls; carries the run
 # ID a handler publishes its async result back to (see AutomationClient.run_async).
@@ -20,9 +27,41 @@ def _now() -> float:
     return time.time()
 
 
+_NO_CORE_URL = "CORE_URL is not set: core sets it for every app it runs; outside core pass the URL to the constructor"
+_NO_TOKEN = "LOCALITAS_API_TOKEN is not set: core sets it for every app it runs; outside core pass the token to the constructor"
+
+
+def core_url_from_env() -> str:
+    """Core's base URL from CORE_URL, which core sets for every app it runs.
+    Raises ConfigError when it is unset or not an absolute http(s) URL."""
+    url = os.environ.get("CORE_URL", "").strip()
+    if not url:
+        raise ConfigError(_NO_CORE_URL)
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ConfigError(f"CORE_URL {url!r} is not an absolute http(s) URL")
+    return url.rstrip("/")
+
+
+def websocket_url(base_url: str, path: str) -> str:
+    """The WebSocket URL of ``path`` on core at ``base_url``: ws for an http
+    URL, wss for an https one. Raises ConfigError for an empty or non-http(s)
+    base URL."""
+    if not base_url:
+        raise ConfigError(_NO_CORE_URL)
+    parts = urllib.parse.urlsplit(base_url)
+    scheme = {"http": "ws", "https": "wss"}.get(parts.scheme)
+    if not scheme or not parts.netloc:
+        raise ConfigError(f"core URL {base_url!r} is not an absolute http(s) URL")
+    return urllib.parse.urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + path, "", ""))
+
+
 def default_token() -> str:
-    """Read the API token from ~/.localitas/config-core.yaml (core.auth.api_token).
-    Returns empty string if not found."""
+    """Deprecated: use LocalitasClient.default(). The API token from
+    LOCALITAS_API_TOKEN, else from ~/.localitas/config-core.yaml
+    (core.auth.api_token); empty string if neither has one."""
+    if os.environ.get("LOCALITAS_API_TOKEN"):
+        return os.environ["LOCALITAS_API_TOKEN"]
     config_path = Path.home() / ".localitas" / "config-core.yaml"
     if config_path.exists():
         for line in config_path.read_text().splitlines():
@@ -32,6 +71,10 @@ def default_token() -> str:
                 if val.startswith("lt_"):
                     return val
     return ""
+
+
+class ConfigError(Exception):
+    """The SDK lacks a setting it needs to reach core, such as CORE_URL."""
 
 
 class APIError(Exception):
@@ -47,17 +90,32 @@ class LocalitasClient:
     """Client for the Localitas platform HTTP API.
 
     Usage:
-        client = LocalitasClient("http://localhost:8090")
-        authed = client.with_token(bearer_token)
-        databases = authed.list_databases()
+        client = LocalitasClient.default()
+        databases = client.list_databases()
     """
 
     def __init__(self, base_url: str, token: str = ""):
         self.base_url = base_url.rstrip("/")
         self.token = token
 
+    @classmethod
+    def default(cls) -> "LocalitasClient":
+        """The client of an app core runs: core's URL from CORE_URL and the
+        app's token from LOCALITAS_API_TOKEN, both set by core. Raises
+        ConfigError naming the variable that is missing or malformed."""
+        url = core_url_from_env()
+        token = os.environ.get("LOCALITAS_API_TOKEN", "")
+        if not token:
+            raise ConfigError(_NO_TOKEN)
+        return cls(url, token)
+
     def with_token(self, token: str) -> "LocalitasClient":
         return LocalitasClient(self.base_url, token)
+
+    def _url(self, path: str) -> str:
+        if not self.base_url:
+            raise ConfigError(_NO_CORE_URL)
+        return self.base_url + path
 
     def _bearer(self) -> str:
         """The token to send. An identity token within a minute of its expiry
@@ -69,7 +127,7 @@ class LocalitasClient:
         claims = unverified_claims(self.token) if self.token else {}
         exp, limit = int(claims.get("exp") or 0), int(claims.get("max") or 0)
         if exp and limit > exp and exp - _now() < _REFRESH_BEFORE_SECONDS:
-            req = Request(self.base_url + "/api/auth/identity/refresh", data=b"", method="POST")
+            req = Request(self._url("/api/auth/identity/refresh"), data=b"", method="POST")
             req.add_header("Authorization", f"Bearer {self.token}")
             try:
                 with urlopen(req, timeout=10) as resp:
@@ -167,8 +225,8 @@ class LocalitasClient:
 
     def announce(self, port: int) -> "Announcement":
         """Register the app listening on port with core, so core proxies to it
-        and runs its jobs. The app tells core only where it is
-        (http://localhost:<port>); core reads the rest from its health.json,
+        and runs its jobs. The app tells core only where it is (this host,
+        port); core reads the rest from its health.json,
         cron.json and public-paths.json. Returns at once and keeps trying in
         a background thread until core takes the app, since core reads the
         app while registering it: call it before serving. Call withdraw() on
@@ -284,8 +342,7 @@ class LocalitasClient:
 
     def ingest_dogstatsd(self, lines: str) -> int:
         """Ingest DogStatsD-format metric lines (text/plain). Returns accepted count."""
-        url = self.base_url + "/apps/tsdb/api/ingest"
-        req = Request(url, data=lines.encode(), method="POST")
+        req = Request(self._url("/apps/tsdb/api/ingest"), data=lines.encode(), method="POST")
         bearer = self._bearer()
         if bearer:
             req.add_header("Authorization", f"Bearer {bearer}")
@@ -332,10 +389,33 @@ class LocalitasClient:
         """
         return CacheRef(self, name)
 
+    def app(self, name: str) -> "AppRef":
+        """Return an AppRef that calls the app ``name`` through core.
+
+        Usage:
+            forecast = client.app("weather").get("/api/forecast")
+        """
+        return AppRef(self, name)
+
+    def db(self, name: str) -> "Connection":
+        """A DB-API connection (``dbapi.Connection``) to the app's system
+        database ``name``, through this client. Its ID is asked of core on
+        first use, so making one never fails.
+
+        Usage:
+            cur = client.db("notes").cursor()
+            cur.execute("SELECT id, title FROM notes")
+        """
+        from .dbapi import Connection
+
+        if not name:
+            raise ValueError("database name must not be empty")
+        return Connection(self, name=name)
+
     # ── Transport ──────────────────────────────────────────────
 
     def _do(self, method: str, path: str, body: Any = None) -> Any:
-        url = self.base_url + path
+        url = self._url(path)
         data = None
         if body is not None:
             data = json.dumps(body).encode()
@@ -428,6 +508,51 @@ class Announcement:
             self._name = ""
 
 
+_APP_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _check_app_name(name: str) -> None:
+    if not isinstance(name, str) or not _APP_NAME.match(name):
+        raise ValueError(f"app name {name!r} must match {_APP_NAME.pattern}")
+
+
+def _check_app_path(path: str) -> None:
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+        raise ValueError(f"app path {path!r} must start with a single /: a path, never an address")
+    if "\\" in path:
+        raise ValueError(f"app path {path!r} must not contain a backslash")
+    parts = urllib.parse.urlsplit(path)
+    if parts.scheme or parts.netloc:
+        raise ValueError(f"app path {path!r} must not name a scheme or host")
+
+
+class AppRef:
+    """Another app, called by name through core at /apps/ext/<name><path>
+    with the client's token. Each call returns the decoded JSON answer (None
+    for an empty one) and raises APIError for a 4xx or 5xx."""
+
+    def __init__(self, client: LocalitasClient, name: str):
+        _check_app_name(name)
+        self._client = client
+        self.name = name
+
+    def _call(self, method: str, path: str, body: Any = None) -> Any:
+        _check_app_path(path)
+        return self._client._do(method, f"/apps/ext/{self.name}{path}", body)
+
+    def get(self, path: str) -> Any:
+        return self._call("GET", path)
+
+    def post(self, path: str, body: Any = None) -> Any:
+        return self._call("POST", path, body)
+
+    def put(self, path: str, body: Any = None) -> Any:
+        return self._call("PUT", path, body)
+
+    def delete(self, path: str) -> Any:
+        return self._call("DELETE", path)
+
+
 def _esc(s: str) -> str:
     return urllib.parse.quote(str(s), safe="")
 
@@ -450,7 +575,7 @@ class CacheRef:
 
     Example::
 
-        client = LocalitasClient("http://localhost:8090").with_token(token)
+        client = LocalitasClient.default()
         cache = client.cache("sessions")
 
         # Key-value with TTL (30 min)
@@ -494,12 +619,49 @@ class CacheRef:
         ch = cache.pubsub("notifications", max_size=1000, max_age_seconds=1209600)
         ch.publish('{"type":"user.signup"}')
         msgs = ch.read("audit-service", count=50)
+
+        # Live delivery over the cache's WebSocket
+        ws = cache.subscribe("notifications", "audit-service", print)
+        ws.close()
     """
 
     def __init__(self, client: LocalitasClient, name: str):
+        import threading
+
         self._client = client
         self._name = name
         self._base = f"/apps/cache/api/caches/{_esc(name)}"
+        self._socket: Optional["PubSubWS"] = None
+        self._socket_lock = threading.Lock()
+
+    # ── Live pub/sub ───────────────────────────────────────────
+
+    def _pubsub_ws(self) -> "PubSubWS":
+        with self._socket_lock:
+            if self._socket is None:
+                url = websocket_url(self._client.base_url, f"/apps/cache/ws/{_esc(self._name)}")
+                self._socket = PubSubWS(url, self._client._bearer())
+            return self._socket
+
+    def subscribe(self, channel: str, consumer: str, callback) -> "PubSubWS":
+        """``PubSubWS.subscribe`` on this cache's WebSocket, opened from the
+        client's URL and token on first use and shared by later calls on
+        this ref. Returns the socket, to ``close()`` it."""
+        ws = self._pubsub_ws()
+        ws.subscribe(channel, consumer, callback)
+        return ws
+
+    def watch(self, channel: str, after_seq: int, callback) -> "PubSubWS":
+        """``PubSubWS.watch`` on this cache's shared WebSocket; returns it."""
+        ws = self._pubsub_ws()
+        ws.watch(channel, after_seq, callback)
+        return ws
+
+    def watch_latest(self, channel: str, callback) -> "PubSubWS":
+        """``PubSubWS.watch_latest`` on this cache's shared WebSocket; returns it."""
+        ws = self._pubsub_ws()
+        ws.watch_latest(channel, callback)
+        return ws
 
     # ── KV ─────────────────────────────────────────────────────
 
@@ -1027,11 +1189,39 @@ class PubSubRef:
         return self.info().get("last_seq", 0)
 
 
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def _header(headers, name: str) -> str:
+    value = headers.get(name)
+    if value is None and isinstance(headers, Mapping):
+        wanted = name.lower()
+        value = next((v for k, v in headers.items() if k.lower() == wanted), None)
+    return value or ""
+
+
+def _run_and_key(source) -> tuple[str, str]:
+    """The run ID and Idempotency-Key of a run ID string, a request, or its
+    headers."""
+    if isinstance(source, str) or not source:
+        return source or "", ""
+    try:
+        headers = source.headers
+    except AttributeError:
+        headers = source
+    return _header(headers, AUTOMATION_RUN_ID_HEADER), _header(headers, IDEMPOTENCY_KEY_HEADER)
+
+
 class AutomationClient:
     """Client for automation run management and async job signaling."""
 
     def __init__(self, client: "LocalitasClient"):
         self._client = client
+
+    def create(self, request: "CreateAutomationRequest") -> dict:
+        """Create an automation from a typed request (see
+        ``localitas_client.automation``) and return the one core made."""
+        return self._client._do("POST", "/apps/automation/api/automations", request.to_dict())
 
     def trigger(self, automation_id: str) -> dict:
         """Trigger an automation and return the run."""
@@ -1041,19 +1231,29 @@ class AutomationClient:
         """Get a run by ID."""
         return self._client._do("GET", f"/apps/automation/api/runs/{run_id}")
 
-    def publish_result(self, run_id: str, status: str = "completed", result: dict = None, error: str = ""):
-        """Signal async job completion. Called from inside the background job."""
+    def publish_result(self, run_id: str, status: str = "completed", result: dict = None, error: str = "",
+                       idempotency_key: str = ""):
+        """Signal async job completion. Called from inside the background job.
+        ``idempotency_key`` (the call's Idempotency-Key header) restricts the
+        completion to the try that call was."""
         payload = {"status": status, "result": result or {}, "error": error}
-        return self._client._do("POST", f"/apps/automation/api/runs/{run_id}/complete", payload)
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key
+        return self._client._do("POST", f"/apps/automation/api/runs/{_esc(run_id)}/complete", payload)
 
-    def run_async(self, run_id: str, work) -> bool:
+    def run_async(self, run_id_or_request, work) -> bool:
         """Run ``work`` in a background thread and publish its result back to the
         automation run when done. ``work`` is a zero-arg callable returning a
-        dict (or None). Returns True if a run_id was supplied (so the handler
-        should respond 202 immediately), False otherwise — mirroring the Go
-        RunAsync fire-and-202 pattern. Extract run_id from the request's
-        ``AUTOMATION_RUN_ID_HEADER`` header before calling.
+        dict (or None). Returns True if the call belongs to a run (so the
+        handler should respond 202 immediately), False otherwise — mirroring
+        the Go RunAsync fire-and-202 pattern.
+
+        Pass the incoming request (anything with ``.headers``) or its headers
+        (any mapping; names match case-insensitively): the run comes from
+        ``AUTOMATION_RUN_ID_HEADER`` and the Idempotency-Key is echoed in the
+        completion. A run ID string also works, without the key.
         """
+        run_id, key = _run_and_key(run_id_or_request)
         if not run_id:
             return False
 
@@ -1069,7 +1269,7 @@ class AutomationClient:
             if result is None:
                 result = {}
             result["duration_ms"] = int((time.time() - start) * 1000)
-            self.publish_result(run_id, status, result, error)
+            self.publish_result(run_id, status, result, error, idempotency_key=key)
 
         threading.Thread(target=_run, daemon=True).start()
         return True
@@ -1099,8 +1299,7 @@ class AutomationClient:
         if run.get("status") in ("completed", "failed"):
             return run
 
-        ws_url = self._client.base_url.replace("http://", "ws://").replace("https://", "wss://")
-        ws_url += "/apps/cache/ws/localitas_automations"
+        ws_url = websocket_url(self._client.base_url, "/apps/cache/ws/localitas_automations")
         finished = threading.Event()
 
         def on_msg(msg):
@@ -1110,7 +1309,7 @@ class AutomationClient:
             except (ValueError, AttributeError):
                 pass
 
-        ps = PubSubWS(ws_url, self._client.token)
+        ps = PubSubWS(ws_url, self._client._bearer())
         try:
             ps.watch(channel, noted, on_msg)
             if not finished.wait(timeout=timeout):
@@ -1127,13 +1326,15 @@ class PubSubWS:
     Re-subscribes to all channels after reconnect. Cursor-based delivery
     ensures no missed messages.
 
+    Apps get one from ``CacheRef.subscribe``/``watch``/``watch_latest``,
+    which build its URL from the client's.
+
     Example::
 
         def on_msg(msg):
             print(f"seq={msg['seq']} value={msg['value']}")
 
-        ws = PubSubWS("ws://localhost:8080/apps/cache/ws/my-cache", token="lt_xxx")
-        ws.subscribe("events", "consumer-1", on_msg)
+        ws = LocalitasClient.default().cache("my-cache").subscribe("events", "consumer-1", on_msg)
         ws.publish("events", '{"type":"test"}')
         # ... later
         ws.close()

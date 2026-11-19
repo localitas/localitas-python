@@ -1,0 +1,88 @@
+{
+  "name": "nightly-sync",
+  "description": "Sync, wait for its follow-ups, report",
+  "trigger_type": "periodic",
+  "is_enabled": true,
+  "trigger_config": {
+    "periodic": {
+      "schedule": "0 3 * * *",
+      "timezone": "Europe/Paris",
+      "catchup": "all",
+      "catchup_window": "48h"
+    },
+    "retries": 1,
+    "retry_delay": "5m",
+    "max_active_runs": 2,
+    "sla": "2h"
+  },
+  "dag_config": {
+    "dag_id": "nightly-sync",
+    "name": "nightly-sync",
+    "description": "Sync, wait for its follow-ups, report",
+    "nodes": [
+      {
+        "node_id": "fetch",
+        "node_type": "http-api",
+        "execution_strategy": "any_node",
+        "retries": 2,
+        "retry_delay": "30s",
+        "pool": "net",
+        "pool_slots": 2,
+        "trigger_rule": "all_success",
+        "metadata": {
+          "app": {"app": "weather", "path": "/api/sync", "protocol": "http"},
+          "method": "POST",
+          "deferrable": false
+        }
+      },
+      {
+        "node_id": "wait_event",
+        "node_type": "sensor",
+        "execution_strategy": "any_node",
+        "dependencies": ["fetch"],
+        "depends_on_past": true,
+        "trigger_rule": "all_done",
+        "metadata": {"wait_for": "event", "event_type": "invoice.paid", "timeout": "1h"}
+      },
+      {
+        "node_id": "wait_time",
+        "node_type": "sensor",
+        "execution_strategy": "any_node",
+        "dependencies": ["fetch"],
+        "metadata": {"wait_for": "time", "delay": "15m"}
+      },
+      {
+        "node_id": "wait_file",
+        "node_type": "sensor",
+        "execution_strategy": "all_nodes",
+        "dependencies": ["fetch"],
+        "metadata": {"wait_for": "file", "paths": ["/Documents/inbox"]}
+      },
+      {
+        "node_id": "wait_paid",
+        "node_type": "sensor",
+        "execution_strategy": "any_node",
+        "dependencies": ["fetch"],
+        "priority_weight": 10,
+        "metadata": {
+          "wait_for": "pubsub",
+          "cache": "localitas_automations",
+          "channel": "orders",
+          "match": {"status": "paid", "order.total": 100},
+          "timeout": "2h"
+        }
+      },
+      {
+        "node_id": "report",
+        "node_type": "http-api",
+        "execution_strategy": "any_node",
+        "dependencies": ["wait_event", "wait_time", "wait_file", "wait_paid"],
+        "trigger_rule": "one_success",
+        "metadata": {
+          "url": "https://example.com/hook",
+          "body": {"ok": true}
+        }
+      }
+    ]
+  }
+}

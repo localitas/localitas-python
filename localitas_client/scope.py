@@ -91,16 +91,21 @@ def reset_identity_public_keys() -> None:
 def _system_token() -> str:
     from .client import default_token
 
-    return os.environ.get("LOCALITAS_API_TOKEN") or default_token()
+    return default_token()
 
 
 def _fetch_public_key() -> None:
+    from .client import ConfigError, core_url_from_env
+
     global _public_keys, _last_fetch, _fetched_key
     token = _system_token()
     if not token or time.time() - _last_fetch < _KEY_FETCH_RETRY:
         return
+    try:
+        base = core_url_from_env()
+    except ConfigError:
+        return
     _last_fetch = time.time()
-    base = (os.environ.get("CORE_URL") or "http://localhost:8080").rstrip("/")
     req = urllib.request.Request(base + "/api/auth/identity/public-key", headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=3) as resp:

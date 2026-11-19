@@ -60,6 +60,7 @@ class _CacheWSHandler(socketserver.BaseRequestHandler):
             raw += sock.recv(4096)
         lines = raw.decode().split("\r\n")
         headers = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:] if l)}
+        headers[":path"] = lines[0].split(" ")[1]
         self.headers.put(headers)
         accept = base64.b64encode(hashlib.sha1((headers["sec-websocket-key"] + _GUID).encode()).digest()).decode()
         sock.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
