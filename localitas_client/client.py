@@ -5,6 +5,7 @@ import os
 import re
 import time
 import urllib.parse
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.request import Request, urlopen
@@ -1187,6 +1188,29 @@ class PubSubRef:
         return self.info().get("last_seq", 0)
 
 
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+def _header(headers, name: str) -> str:
+    value = headers.get(name)
+    if value is None and isinstance(headers, Mapping):
+        wanted = name.lower()
+        value = next((v for k, v in headers.items() if k.lower() == wanted), None)
+    return value or ""
+
+
+def _run_and_key(source) -> tuple[str, str]:
+    """The run ID and Idempotency-Key of a run ID string, a request, or its
+    headers."""
+    if isinstance(source, str) or not source:
+        return source or "", ""
+    try:
+        headers = source.headers
+    except AttributeError:
+        headers = source
+    return _header(headers, AUTOMATION_RUN_ID_HEADER), _header(headers, IDEMPOTENCY_KEY_HEADER)
+
+
 class AutomationClient:
     """Client for automation run management and async job signaling."""
 
@@ -1201,19 +1225,29 @@ class AutomationClient:
         """Get a run by ID."""
         return self._client._do("GET", f"/apps/automation/api/runs/{run_id}")
 
-    def publish_result(self, run_id: str, status: str = "completed", result: dict = None, error: str = ""):
-        """Signal async job completion. Called from inside the background job."""
+    def publish_result(self, run_id: str, status: str = "completed", result: dict = None, error: str = "",
+                       idempotency_key: str = ""):
+        """Signal async job completion. Called from inside the background job.
+        ``idempotency_key`` (the call's Idempotency-Key header) restricts the
+        completion to the try that call was."""
         payload = {"status": status, "result": result or {}, "error": error}
-        return self._client._do("POST", f"/apps/automation/api/runs/{run_id}/complete", payload)
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key
+        return self._client._do("POST", f"/apps/automation/api/runs/{_esc(run_id)}/complete", payload)
 
-    def run_async(self, run_id: str, work) -> bool:
+    def run_async(self, run_id_or_request, work) -> bool:
         """Run ``work`` in a background thread and publish its result back to the
         automation run when done. ``work`` is a zero-arg callable returning a
-        dict (or None). Returns True if a run_id was supplied (so the handler
-        should respond 202 immediately), False otherwise — mirroring the Go
-        RunAsync fire-and-202 pattern. Extract run_id from the request's
-        ``AUTOMATION_RUN_ID_HEADER`` header before calling.
+        dict (or None). Returns True if the call belongs to a run (so the
+        handler should respond 202 immediately), False otherwise — mirroring
+        the Go RunAsync fire-and-202 pattern.
+
+        Pass the incoming request (anything with ``.headers``) or its headers
+        (any mapping; names match case-insensitively): the run comes from
+        ``AUTOMATION_RUN_ID_HEADER`` and the Idempotency-Key is echoed in the
+        completion. A run ID string also works, without the key.
         """
+        run_id, key = _run_and_key(run_id_or_request)
         if not run_id:
             return False
 
@@ -1229,7 +1263,7 @@ class AutomationClient:
             if result is None:
                 result = {}
             result["duration_ms"] = int((time.time() - start) * 1000)
-            self.publish_result(run_id, status, result, error)
+            self.publish_result(run_id, status, result, error, idempotency_key=key)
 
         threading.Thread(target=_run, daemon=True).start()
         return True
