@@ -6,9 +6,12 @@ import re
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+
+if TYPE_CHECKING:
+    from .dbapi import Connection
 
 # Header the platform sets on automation-triggered HTTP calls; carries the run
 # ID a handler publishes its async result back to (see AutomationClient.run_async).
@@ -391,6 +394,21 @@ class LocalitasClient:
             forecast = client.app("weather").get("/api/forecast")
         """
         return AppRef(self, name)
+
+    def db(self, name: str) -> "Connection":
+        """A DB-API connection (``dbapi.Connection``) to the app's system
+        database ``name``, through this client. Its ID is asked of core on
+        first use, so making one never fails.
+
+        Usage:
+            cur = client.db("notes").cursor()
+            cur.execute("SELECT id, title FROM notes")
+        """
+        from .dbapi import Connection
+
+        if not name:
+            raise ValueError("database name must not be empty")
+        return Connection(self, name=name)
 
     # ── Transport ──────────────────────────────────────────────
 
