@@ -37,8 +37,12 @@ def nightly_sync() -> CreateAutomationRequest:
                         dependencies=["fetch"], depends_on_past=True, trigger_rule="all_done"),
             sensor_node("wait_time", "any_node", time_sensor("15m"), dependencies=["fetch"]),
             sensor_node("wait_file", "all_nodes", file_sensor(["/Documents/inbox"]), dependencies=["fetch"]),
+            sensor_node("wait_paid", "any_node",
+                        pubsub_sensor("orders", match={"status": "paid", "order.total": 100},
+                                      cache="localitas_automations", timeout="2h"),
+                        dependencies=["fetch"], priority_weight=10),
             http_node("report", "any_node", HTTPSettings(url="https://example.com/hook", body={"ok": True}),
-                      dependencies=["wait_event", "wait_time", "wait_file"], trigger_rule="one_success"),
+                      dependencies=["wait_event", "wait_time", "wait_file", "wait_paid"], trigger_rule="one_success"),
         ]),
     )
 

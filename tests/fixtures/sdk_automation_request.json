@@ -59,10 +59,24 @@
         "metadata": {"wait_for": "file", "paths": ["/Documents/inbox"]}
       },
       {
+        "node_id": "wait_paid",
+        "node_type": "sensor",
+        "execution_strategy": "any_node",
+        "dependencies": ["fetch"],
+        "priority_weight": 10,
+        "metadata": {
+          "wait_for": "pubsub",
+          "cache": "localitas_automations",
+          "channel": "orders",
+          "match": {"status": "paid", "order.total": 100},
+          "timeout": "2h"
+        }
+      },
+      {
         "node_id": "report",
         "node_type": "http-api",
         "execution_strategy": "any_node",
-        "dependencies": ["wait_event", "wait_time", "wait_file"],
+        "dependencies": ["wait_event", "wait_time", "wait_file", "wait_paid"],
         "trigger_rule": "one_success",
         "metadata": {
           "url": "https://example.com/hook",
