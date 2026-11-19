@@ -74,6 +74,9 @@ class TestClient(unittest.TestCase):
             return 200, {"columns": ["id", "name"], "rows": [[1, "Alice"], [2, "Bob"]]}
 
         def handle_sql_exec(headers, body, path):
+            if "unless_exists" in (body or {}):
+                self.captured_unless_exists = body["unless_exists"]
+                return 200, {"rows_affected": 0, "skipped": True}
             if "statements" in (body or {}):
                 return 200, {"rows_affected": len(body["statements"])}
             return 200, {"rows_affected": 1}
@@ -149,6 +152,16 @@ class TestClient(unittest.TestCase):
             {"sql": "INSERT INTO b VALUES (?)", "args": [2]},
         ])
         self.assertEqual(result["rows_affected"], 2)
+
+    def test_sql_transaction_unless_exists(self):
+        client = LocalitasClient(self.base_url)
+        result = client.sql_transaction(
+            "db1",
+            [{"sql": "INSERT INTO a VALUES (?)", "args": [1]}],
+            unless_exists={"sql": "SELECT 1 FROM a WHERE v = ?", "args": [1]},
+        )
+        self.assertTrue(result["skipped"])
+        self.assertEqual(self.captured_unless_exists, {"sql": "SELECT 1 FROM a WHERE v = ?", "args": [1]})
 
     def test_search_fts(self):
         client = LocalitasClient(self.base_url)

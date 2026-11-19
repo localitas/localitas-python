@@ -24,25 +24,34 @@ def write_migrations(files):
     return d
 
 
-def sqlite_migrator(migrations_dir, db_path):
-    """A Migrator whose callables run on their own SQLite connection."""
+def sqlite_migrator(migrations_dir, db_path, conditional=True):
+    """A Migrator whose callables run on their own SQLite connection. Its
+    transactions honour unless_exists as core does: the query runs inside the
+    transaction, first, and a row means nothing applies. conditional=False
+    ignores it, as a core without conditional transactions would."""
     conn = sqlite3.connect(db_path, timeout=10, isolation_level=None, check_same_thread=False)
 
     def exec_sql(sql, *args):
         conn.execute(sql, args)
 
     def query_sql(sql, *args):
-        return {"rows": [list(r) for r in conn.execute(sql, args).fetchall()]}
+        # A core before 2026-11-19 answers an empty result with rows null.
+        return {"rows": [list(r) for r in conn.execute(sql, args).fetchall()] or None}
 
-    def exec_tx(statements):
+    def exec_tx(statements, unless_exists):
         conn.execute("BEGIN IMMEDIATE")
         try:
+            sql, args = unless_exists
+            if conditional and conn.execute(sql, args).fetchone() is not None:
+                conn.execute("ROLLBACK")
+                return {"skipped": True}
             for sql, args in statements:
                 conn.execute(sql, args)
         except Exception:
             conn.execute("ROLLBACK")
             raise
         conn.execute("COMMIT")
+        return {"rows_affected": len(statements)}
 
     return Migrator(migrations_dir, exec_sql, query_sql, exec_tx), conn
 
@@ -69,11 +78,20 @@ class TestMigrator(unittest.TestCase):
             ["20260101-000000-000", "20260102-000000-000", "20260103-000000-000"],
         )
 
-    def test_stale_node_does_not_reapply(self):
+    def test_stale_node_is_skipped(self):
         d = write_migrations(SEED)
         first, _ = sqlite_migrator(d, self.db)
         first.run()
         stale, _ = sqlite_migrator(d, self.db)
+        for version, name, sql in stale._migrations:
+            self.assertTrue(stale._apply(version, name, sql), f"{version} must be skipped, not failed")
+        self.assertEqual(rows(self.db, "SELECT name FROM items"), ["default"])
+
+    def test_stale_node_on_a_core_without_conditions_does_not_reapply(self):
+        d = write_migrations(SEED)
+        first, _ = sqlite_migrator(d, self.db)
+        first.run()
+        stale, _ = sqlite_migrator(d, self.db, conditional=False)
         for version, name, sql in stale._migrations:
             with self.assertRaisesRegex(Exception, "UNIQUE constraint failed: schema_migrations.version"):
                 stale._apply(version, name, sql)
