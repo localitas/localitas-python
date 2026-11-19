@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 if TYPE_CHECKING:
+    from .automation import CreateAutomationRequest
     from .dbapi import Connection
 
 # Header the platform sets on automation-triggered HTTP calls; carries the run
@@ -1216,6 +1217,11 @@ class AutomationClient:
 
     def __init__(self, client: "LocalitasClient"):
         self._client = client
+
+    def create(self, request: "CreateAutomationRequest") -> dict:
+        """Create an automation from a typed request (see
+        ``localitas_client.automation``) and return the one core made."""
+        return self._client._do("POST", "/apps/automation/api/automations", request.to_dict())
 
     def trigger(self, automation_id: str) -> dict:
         """Trigger an automation and return the run."""
