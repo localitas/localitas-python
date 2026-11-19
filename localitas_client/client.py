@@ -38,6 +38,19 @@ def core_url_from_env() -> str:
     return url.rstrip("/")
 
 
+def websocket_url(base_url: str, path: str) -> str:
+    """The WebSocket URL of ``path`` on core at ``base_url``: ws for an http
+    URL, wss for an https one. Raises ConfigError for an empty or non-http(s)
+    base URL."""
+    if not base_url:
+        raise ConfigError(_NO_CORE_URL)
+    parts = urllib.parse.urlsplit(base_url)
+    scheme = {"http": "ws", "https": "wss"}.get(parts.scheme)
+    if not scheme or not parts.netloc:
+        raise ConfigError(f"core URL {base_url!r} is not an absolute http(s) URL")
+    return urllib.parse.urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + path, "", ""))
+
+
 def default_token() -> str:
     """Deprecated: use LocalitasClient.default(). The API token from
     LOCALITAS_API_TOKEN, else from ~/.localitas/config-core.yaml
@@ -586,12 +599,49 @@ class CacheRef:
         ch = cache.pubsub("notifications", max_size=1000, max_age_seconds=1209600)
         ch.publish('{"type":"user.signup"}')
         msgs = ch.read("audit-service", count=50)
+
+        # Live delivery over the cache's WebSocket
+        ws = cache.subscribe("notifications", "audit-service", print)
+        ws.close()
     """
 
     def __init__(self, client: LocalitasClient, name: str):
+        import threading
+
         self._client = client
         self._name = name
         self._base = f"/apps/cache/api/caches/{_esc(name)}"
+        self._socket: Optional["PubSubWS"] = None
+        self._socket_lock = threading.Lock()
+
+    # ── Live pub/sub ───────────────────────────────────────────
+
+    def _pubsub_ws(self) -> "PubSubWS":
+        with self._socket_lock:
+            if self._socket is None:
+                url = websocket_url(self._client.base_url, f"/apps/cache/ws/{_esc(self._name)}")
+                self._socket = PubSubWS(url, self._client._bearer())
+            return self._socket
+
+    def subscribe(self, channel: str, consumer: str, callback) -> "PubSubWS":
+        """``PubSubWS.subscribe`` on this cache's WebSocket, opened from the
+        client's URL and token on first use and shared by later calls on
+        this ref. Returns the socket, to ``close()`` it."""
+        ws = self._pubsub_ws()
+        ws.subscribe(channel, consumer, callback)
+        return ws
+
+    def watch(self, channel: str, after_seq: int, callback) -> "PubSubWS":
+        """``PubSubWS.watch`` on this cache's shared WebSocket; returns it."""
+        ws = self._pubsub_ws()
+        ws.watch(channel, after_seq, callback)
+        return ws
+
+    def watch_latest(self, channel: str, callback) -> "PubSubWS":
+        """``PubSubWS.watch_latest`` on this cache's shared WebSocket; returns it."""
+        ws = self._pubsub_ws()
+        ws.watch_latest(channel, callback)
+        return ws
 
     # ── KV ─────────────────────────────────────────────────────
 
@@ -1191,8 +1241,7 @@ class AutomationClient:
         if run.get("status") in ("completed", "failed"):
             return run
 
-        ws_url = self._client.base_url.replace("http://", "ws://").replace("https://", "wss://")
-        ws_url += "/apps/cache/ws/localitas_automations"
+        ws_url = websocket_url(self._client.base_url, "/apps/cache/ws/localitas_automations")
         finished = threading.Event()
 
         def on_msg(msg):
@@ -1202,7 +1251,7 @@ class AutomationClient:
             except (ValueError, AttributeError):
                 pass
 
-        ps = PubSubWS(ws_url, self._client.token)
+        ps = PubSubWS(ws_url, self._client._bearer())
         try:
             ps.watch(channel, noted, on_msg)
             if not finished.wait(timeout=timeout):
@@ -1219,13 +1268,15 @@ class PubSubWS:
     Re-subscribes to all channels after reconnect. Cursor-based delivery
     ensures no missed messages.
 
+    Apps get one from ``CacheRef.subscribe``/``watch``/``watch_latest``,
+    which build its URL from the client's.
+
     Example::
 
         def on_msg(msg):
             print(f"seq={msg['seq']} value={msg['value']}")
 
-        ws = PubSubWS(websocket_url, token=token)
-        ws.subscribe("events", "consumer-1", on_msg)
+        ws = LocalitasClient.default().cache("my-cache").subscribe("events", "consumer-1", on_msg)
         ws.publish("events", '{"type":"test"}')
         # ... later
         ws.close()
