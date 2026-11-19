@@ -75,7 +75,7 @@ class Migrator:
         )
 
         result = self._query("SELECT version FROM schema_migrations")
-        applied = {row[0] for row in (result or {}).get("rows", [])}
+        applied = {row[0] for row in (result or {}).get("rows") or []}
 
         for version, name, sql in self._migrations:
             if version in applied:

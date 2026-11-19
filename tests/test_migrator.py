@@ -35,7 +35,8 @@ def sqlite_migrator(migrations_dir, db_path, conditional=True):
         conn.execute(sql, args)
 
     def query_sql(sql, *args):
-        return {"rows": [list(r) for r in conn.execute(sql, args).fetchall()]}
+        # A core before 2026-11-19 answers an empty result with rows null.
+        return {"rows": [list(r) for r in conn.execute(sql, args).fetchall()] or None}
 
     def exec_tx(statements, unless_exists):
         conn.execute("BEGIN IMMEDIATE")
