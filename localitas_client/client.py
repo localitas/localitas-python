@@ -142,8 +142,20 @@ class LocalitasClient:
     def sql_query(self, db_id: str, sql: str, *args) -> dict:
         return self._do("POST", f"/apps/data/api/databases/{_esc(db_id)}/query", {"sql": sql, "args": list(args)})
 
-    def sql_transaction(self, db_id: str, statements: list[dict]) -> dict:
-        return self._do("POST", f"/apps/data/api/databases/{_esc(db_id)}/exec", {"statements": statements})
+    def sql_transaction(self, db_id: str, statements: list[dict], unless_exists: dict | None = None) -> dict:
+        """Apply statements ({"sql", "args"}) as one atomic transaction.
+
+        ``unless_exists`` ({"sql", "args"}) makes it conditional: core runs
+        that read-only query inside the replicated transaction, on the state
+        every node holds at its place in the log, and applies nothing when it
+        returns a row. The result then has ``"skipped": True`` — a success,
+        not an error — so of writers racing on one condition exactly one
+        applies. Core refuses a query that is not one read-only SELECT, WITH
+        or VALUES statement."""
+        body = {"statements": statements}
+        if unless_exists is not None:
+            body["unless_exists"] = unless_exists
+        return self._do("POST", f"/apps/data/api/databases/{_esc(db_id)}/exec", body)
 
     # ── Search ─────────────────────────────────────────────────
 

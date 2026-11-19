@@ -50,6 +50,16 @@ class Connection:
         self._pending: list[dict] = []
 
     @property
+    def client(self) -> LocalitasClient:
+        """The client this connection talks to core through."""
+        return self._client
+
+    @property
+    def database(self) -> str:
+        """The id of the database this connection is bound to."""
+        return self._database
+
+    @property
     def autocommit(self) -> bool:
         return self._autocommit
 

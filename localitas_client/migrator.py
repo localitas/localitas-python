@@ -8,6 +8,7 @@ Filenames must match the platform timestamp format:
 ``YYYYMMDD-HHMMSS-MMM-description.sql`` (or legacy ``NNN_description.sql``).
 """
 
+import logging
 import os
 import re
 import time
@@ -15,22 +16,22 @@ import time
 _TIMESTAMP_RE = re.compile(r"^(\d{8})-(\d{6})-(\d{3})-(.+)\.sql$")
 _LEGACY_RE = re.compile(r"^(\d+)_(.+)\.sql$")
 
+_log = logging.getLogger(__name__)
+
+_VERSION_RECORDED = "SELECT 1 FROM schema_migrations WHERE version = ?"
+
 
 class Migrator:
     """Applies SQL migrations from ``migrations_dir`` against a database.
 
     ``exec_sql(sql, *args)`` and ``query_sql(sql, *args)`` run one statement;
-    ``exec_tx(statements)`` applies a list of ``(sql, args)`` pairs as one
-    transaction. Bound to a database id, e.g.::
+    ``exec_tx(statements, unless_exists)`` applies a list of ``(sql, args)``
+    pairs as one transaction unless the ``(sql, args)`` query
+    ``unless_exists`` returns a row, and returns a dict whose ``"skipped"``
+    is true when it applied nothing for that reason. ``for_database`` binds
+    all three to a database through the client::
 
-        m = Migrator(
-            "migrations",
-            lambda sql, *a: client.sql_exec(db_id, sql, *a),
-            lambda sql, *a: client.sql_query(db_id, sql, *a),
-            lambda stmts: client.sql_transaction(
-                db_id, [{"sql": s, "args": list(a)} for s, a in stmts]),
-        )
-        m.run()
+        Migrator.for_database("migrations", client, db_id).run()
     """
 
     def __init__(self, migrations_dir, exec_sql, query_sql, exec_tx):
@@ -40,11 +41,34 @@ class Migrator:
         self._exec_tx = exec_tx
         self._migrations = _load_migrations(migrations_dir)
 
+    @classmethod
+    def for_database(cls, migrations_dir, client, db_id):
+        """A Migrator for database ``db_id`` through ``client`` (a
+        LocalitasClient): each migration is one conditional transaction."""
+
+        def exec_tx(statements, unless_exists):
+            sql, args = unless_exists
+            return client.sql_transaction(
+                db_id,
+                [{"sql": s, "args": list(a)} for s, a in statements],
+                unless_exists={"sql": sql, "args": list(args)},
+            )
+
+        return cls(
+            migrations_dir,
+            lambda sql, *a: client.sql_exec(db_id, sql, *a),
+            lambda sql, *a: client.sql_query(db_id, sql, *a),
+            exec_tx,
+        )
+
     def run(self):
         """Apply every pending migration. Each is one transaction that records
         its version before its statements, so it applies whole or not at all,
-        and of several nodes migrating at once exactly one applies it: the
-        others' transactions fail on the version's primary key."""
+        and of several nodes migrating at once exactly one applies it. The
+        transaction is conditional on the version not being recorded yet: core
+        skips the others' transactions, which leaves no failed write in its
+        replicated log. A core without conditional transactions fails them on
+        the version's primary key instead, which is handled the same way."""
         self._exec(
             "CREATE TABLE IF NOT EXISTS schema_migrations ("
             "version TEXT PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)"
@@ -57,9 +81,11 @@ class Migrator:
             if version in applied:
                 continue
             try:
-                self._apply(version, name, sql)
+                if self._apply(version, name, sql):
+                    _log.info("migration %s_%s was applied by another node", version, name)
             except Exception as exc:  # noqa: BLE001
                 if _is_version_taken(exc):
+                    _log.info("migration %s_%s was applied by another node", version, name)
                     continue
                 if not _is_idempotent_error(exc):
                     raise
@@ -68,11 +94,17 @@ class Migrator:
                 self._repair(version, name, sql)
 
     def _apply(self, version, name, sql):
+        """Apply one migration; True when it was skipped because its version
+        was already recorded."""
         record = (
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
             (version, name, int(time.time())),
         )
-        self._exec_tx([record] + [(stmt, ()) for stmt in _split_sql(sql)])
+        result = self._exec_tx(
+            [record] + [(stmt, ()) for stmt in _split_sql(sql)],
+            (_VERSION_RECORDED, (version,)),
+        )
+        return bool((result or {}).get("skipped"))
 
     def _repair(self, version, name, sql):
         for stmt in _split_sql(sql):
