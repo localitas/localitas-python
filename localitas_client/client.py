@@ -1,6 +1,8 @@
 """Localitas Python SDK — mirrors the Go client at /client/client.go."""
 
 import json
+import os
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -20,9 +22,28 @@ def _now() -> float:
     return time.time()
 
 
+_NO_CORE_URL = "CORE_URL is not set: core sets it for every app it runs; outside core pass the URL to the constructor"
+_NO_TOKEN = "LOCALITAS_API_TOKEN is not set: core sets it for every app it runs; outside core pass the token to the constructor"
+
+
+def core_url_from_env() -> str:
+    """Core's base URL from CORE_URL, which core sets for every app it runs.
+    Raises ConfigError when it is unset or not an absolute http(s) URL."""
+    url = os.environ.get("CORE_URL", "").strip()
+    if not url:
+        raise ConfigError(_NO_CORE_URL)
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ConfigError(f"CORE_URL {url!r} is not an absolute http(s) URL")
+    return url.rstrip("/")
+
+
 def default_token() -> str:
-    """Read the API token from ~/.localitas/config-core.yaml (core.auth.api_token).
-    Returns empty string if not found."""
+    """Deprecated: use LocalitasClient.default(). The API token from
+    LOCALITAS_API_TOKEN, else from ~/.localitas/config-core.yaml
+    (core.auth.api_token); empty string if neither has one."""
+    if os.environ.get("LOCALITAS_API_TOKEN"):
+        return os.environ["LOCALITAS_API_TOKEN"]
     config_path = Path.home() / ".localitas" / "config-core.yaml"
     if config_path.exists():
         for line in config_path.read_text().splitlines():
@@ -32,6 +53,10 @@ def default_token() -> str:
                 if val.startswith("lt_"):
                     return val
     return ""
+
+
+class ConfigError(Exception):
+    """The SDK lacks a setting it needs to reach core, such as CORE_URL."""
 
 
 class APIError(Exception):
@@ -47,17 +72,32 @@ class LocalitasClient:
     """Client for the Localitas platform HTTP API.
 
     Usage:
-        client = LocalitasClient("http://localhost:8090")
-        authed = client.with_token(bearer_token)
-        databases = authed.list_databases()
+        client = LocalitasClient.default()
+        databases = client.list_databases()
     """
 
     def __init__(self, base_url: str, token: str = ""):
         self.base_url = base_url.rstrip("/")
         self.token = token
 
+    @classmethod
+    def default(cls) -> "LocalitasClient":
+        """The client of an app core runs: core's URL from CORE_URL and the
+        app's token from LOCALITAS_API_TOKEN, both set by core. Raises
+        ConfigError naming the variable that is missing or malformed."""
+        url = core_url_from_env()
+        token = os.environ.get("LOCALITAS_API_TOKEN", "")
+        if not token:
+            raise ConfigError(_NO_TOKEN)
+        return cls(url, token)
+
     def with_token(self, token: str) -> "LocalitasClient":
         return LocalitasClient(self.base_url, token)
+
+    def _url(self, path: str) -> str:
+        if not self.base_url:
+            raise ConfigError(_NO_CORE_URL)
+        return self.base_url + path
 
     def _bearer(self) -> str:
         """The token to send. An identity token within a minute of its expiry
@@ -69,7 +109,7 @@ class LocalitasClient:
         claims = unverified_claims(self.token) if self.token else {}
         exp, limit = int(claims.get("exp") or 0), int(claims.get("max") or 0)
         if exp and limit > exp and exp - _now() < _REFRESH_BEFORE_SECONDS:
-            req = Request(self.base_url + "/api/auth/identity/refresh", data=b"", method="POST")
+            req = Request(self._url("/api/auth/identity/refresh"), data=b"", method="POST")
             req.add_header("Authorization", f"Bearer {self.token}")
             try:
                 with urlopen(req, timeout=10) as resp:
@@ -167,8 +207,8 @@ class LocalitasClient:
 
     def announce(self, port: int) -> "Announcement":
         """Register the app listening on port with core, so core proxies to it
-        and runs its jobs. The app tells core only where it is
-        (http://localhost:<port>); core reads the rest from its health.json,
+        and runs its jobs. The app tells core only where it is (this host,
+        port); core reads the rest from its health.json,
         cron.json and public-paths.json. Returns at once and keeps trying in
         a background thread until core takes the app, since core reads the
         app while registering it: call it before serving. Call withdraw() on
@@ -284,8 +324,7 @@ class LocalitasClient:
 
     def ingest_dogstatsd(self, lines: str) -> int:
         """Ingest DogStatsD-format metric lines (text/plain). Returns accepted count."""
-        url = self.base_url + "/apps/tsdb/api/ingest"
-        req = Request(url, data=lines.encode(), method="POST")
+        req = Request(self._url("/apps/tsdb/api/ingest"), data=lines.encode(), method="POST")
         bearer = self._bearer()
         if bearer:
             req.add_header("Authorization", f"Bearer {bearer}")
@@ -332,10 +371,18 @@ class LocalitasClient:
         """
         return CacheRef(self, name)
 
+    def app(self, name: str) -> "AppRef":
+        """Return an AppRef that calls the app ``name`` through core.
+
+        Usage:
+            forecast = client.app("weather").get("/api/forecast")
+        """
+        return AppRef(self, name)
+
     # ── Transport ──────────────────────────────────────────────
 
     def _do(self, method: str, path: str, body: Any = None) -> Any:
-        url = self.base_url + path
+        url = self._url(path)
         data = None
         if body is not None:
             data = json.dumps(body).encode()
@@ -428,6 +475,51 @@ class Announcement:
             self._name = ""
 
 
+_APP_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _check_app_name(name: str) -> None:
+    if not isinstance(name, str) or not _APP_NAME.match(name):
+        raise ValueError(f"app name {name!r} must match {_APP_NAME.pattern}")
+
+
+def _check_app_path(path: str) -> None:
+    if not isinstance(path, str) or not path.startswith("/") or path.startswith("//"):
+        raise ValueError(f"app path {path!r} must start with a single /: a path, never an address")
+    if "\\" in path:
+        raise ValueError(f"app path {path!r} must not contain a backslash")
+    parts = urllib.parse.urlsplit(path)
+    if parts.scheme or parts.netloc:
+        raise ValueError(f"app path {path!r} must not name a scheme or host")
+
+
+class AppRef:
+    """Another app, called by name through core at /apps/ext/<name><path>
+    with the client's token. Each call returns the decoded JSON answer (None
+    for an empty one) and raises APIError for a 4xx or 5xx."""
+
+    def __init__(self, client: LocalitasClient, name: str):
+        _check_app_name(name)
+        self._client = client
+        self.name = name
+
+    def _call(self, method: str, path: str, body: Any = None) -> Any:
+        _check_app_path(path)
+        return self._client._do(method, f"/apps/ext/{self.name}{path}", body)
+
+    def get(self, path: str) -> Any:
+        return self._call("GET", path)
+
+    def post(self, path: str, body: Any = None) -> Any:
+        return self._call("POST", path, body)
+
+    def put(self, path: str, body: Any = None) -> Any:
+        return self._call("PUT", path, body)
+
+    def delete(self, path: str) -> Any:
+        return self._call("DELETE", path)
+
+
 def _esc(s: str) -> str:
     return urllib.parse.quote(str(s), safe="")
 
@@ -450,7 +542,7 @@ class CacheRef:
 
     Example::
 
-        client = LocalitasClient("http://localhost:8090").with_token(token)
+        client = LocalitasClient.default()
         cache = client.cache("sessions")
 
         # Key-value with TTL (30 min)
@@ -1132,7 +1224,7 @@ class PubSubWS:
         def on_msg(msg):
             print(f"seq={msg['seq']} value={msg['value']}")
 
-        ws = PubSubWS("ws://localhost:8080/apps/cache/ws/my-cache", token="lt_xxx")
+        ws = PubSubWS(websocket_url, token=token)
         ws.subscribe("events", "consumer-1", on_msg)
         ws.publish("events", '{"type":"test"}')
         # ... later

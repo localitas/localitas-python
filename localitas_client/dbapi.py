@@ -1,6 +1,6 @@
 """PEP 249 (DB-API 2.0) compliant interface for Localitas databases."""
 
-from .client import LocalitasClient, APIError
+from .client import LocalitasClient, APIError, core_url_from_env
 
 apilevel = "2.0"
 threadsafety = 1
@@ -34,11 +34,14 @@ def _is_read_query(sql: str) -> bool:
     return first_word in _READ_PREFIXES
 
 
-def connect(database: str, host: str = "localhost:8080", token: str = "") -> "Connection":
-    scheme = "http://" if not host.startswith("http") else ""
-    base_url = f"{scheme}{host}"
-    client = LocalitasClient(base_url, token=token)
-    return Connection(client, database)
+def connect(database: str, host: str = "", token: str = "") -> "Connection":
+    """Connect to a database by ID through core at ``host``, or else at
+    CORE_URL. Prefer ``LocalitasClient.default().db(name)``."""
+    if host:
+        base_url = host if host.startswith("http") else f"http://{host}"
+    else:
+        base_url = core_url_from_env()
+    return Connection(LocalitasClient(base_url, token=token), database)
 
 
 class Connection:
