@@ -1,6 +1,7 @@
 from .client import (
     LocalitasClient, APIError, ConfigError, AppRef, Announcement, PubSubWS,
-    AUTOMATION_RUN_ID_HEADER, IDEMPOTENCY_KEY_HEADER, default_token, websocket_url,
+    AUTOMATION_RUN_ID_HEADER, IDEMPOTENCY_KEY_HEADER, PHASE_RAFT_READY, PHASE_READY, PHASE_SERVING,
+    default_token, websocket_url,
 )
 from .automation import (
     AppCall, CreateAutomationRequest, DAGConfig, DAGNode, EventTrigger, HTTPSettings, PeriodicTrigger, Sensor,
@@ -35,6 +36,9 @@ __all__ = [
     "default_token",
     "AUTOMATION_RUN_ID_HEADER",
     "IDEMPOTENCY_KEY_HEADER",
+    "PHASE_RAFT_READY",
+    "PHASE_SERVING",
+    "PHASE_READY",
     "Migrator",
     "crypto",
     "scope",

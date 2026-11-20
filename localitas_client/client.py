@@ -3,13 +3,14 @@
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 if TYPE_CHECKING:
     from .automation import CreateAutomationRequest
@@ -21,6 +22,19 @@ AUTOMATION_RUN_ID_HEADER = "Localitas-Automation-Run-ID"
 
 # How close to its expiry a client refreshes the identity token it acts with.
 _REFRESH_BEFORE_SECONDS = 60
+
+# The phases of a node's lifecycle wait_ready can wait for: every shard has a
+# leader; core serves its own calls (users still get 503); every route serves.
+PHASE_RAFT_READY = "raft_ready"
+PHASE_SERVING = "serving"
+PHASE_READY = "ready"
+
+# How long core holds one readiness question before answering that the node
+# is not there yet: under core's shortest HTTP write timeout (30 s), which
+# would cut a longer one.
+_READY_POLL_TIMEOUT = 25
+_REDIAL_FIRST = 0.1
+_REDIAL_MAX = 5.0
 
 
 def _now() -> float:
@@ -227,15 +241,74 @@ class LocalitasClient:
         """Register the app listening on port with core, so core proxies to it
         and runs its jobs. The app tells core only where it is (this host,
         port); core reads the rest from its health.json,
-        cron.json and public-paths.json. Returns at once and keeps trying in
-        a background thread until core takes the app, since core reads the
-        app while registering it: call it before serving. Call withdraw() on
-        shutdown.
+        cron.json and public-paths.json. Returns at once and, in a
+        background thread, waits until core is ready (wait_ready) and
+        registers the app once, since core reads the app while registering
+        it: call it before serving. A registration core answers 503 (not
+        ready: it restarted) waits again; any other failure is logged at
+        ERROR and not tried again. Call withdraw() on shutdown.
 
         In a container it does nothing: core registers app containers itself
         when Docker reports them healthy, and only core knows the port it
         published."""
         return Announcement(self, port)
+
+    def wait_ready(self, phase: str = PHASE_READY, stop: "Optional[threading.Event]" = None) -> bool:
+        """Wait until the node this client talks to is at phase (PHASE_READY,
+        PHASE_SERVING or PHASE_RAFT_READY) with every hook of it finished.
+        Asks core's readiness endpoint, a long poll core answers at the
+        transition itself, and asks again when core answers that the node is
+        not there yet: the poll's timeout passed, or the node drains (its
+        next boot follows). Returns True once ready, False once stop is set
+        (a poll in flight ends first, within core's hold). Any other
+        failure, a fault no waiting mends, is raised."""
+        stop = stop or threading.Event()
+        redial = _REDIAL_FIRST
+        while not stop.is_set():
+            try:
+                ready, phase_now, retry_after = self._ask_ready(phase)
+            except OSError as e:
+                if not _core_down(e):
+                    raise
+                # Core's process is not running or not yet listening: the one
+                # case with no event to wait on, so dial again after a
+                # bounded backoff.
+                if stop.wait(redial):
+                    return False
+                redial = min(2 * redial, _REDIAL_MAX)
+                continue
+            redial = _REDIAL_FIRST
+            if ready:
+                return True
+            # A draining node answers at once until its HTTP stops; core says
+            # when to ask again.
+            if phase_now in ("draining", "stopped") and stop.wait(retry_after):
+                return False
+        return False
+
+    def _ask_ready(self, phase: str) -> tuple[bool, str, float]:
+        """Ask core's readiness endpoint once, held up to _READY_POLL_TIMEOUT:
+        whether the node is ready, its phase now, and core's Retry-After."""
+        query = urllib.parse.urlencode({"phase": phase, "timeout": f"{_READY_POLL_TIMEOUT}s"})
+        path = f"/api/system/ready?{query}"
+        try:
+            with urlopen(Request(self._url(path)), timeout=_READY_POLL_TIMEOUT + 30) as resp:
+                status, body, headers = resp.status, resp.read().decode(), resp.headers
+        except HTTPError as e:
+            status, body, headers = e.code, e.read().decode(), e.headers
+            if status != 503:
+                raise APIError("GET", path, status, body) from None
+        try:
+            answer = json.loads(body)
+        except ValueError:
+            answer = None
+        if not isinstance(answer, dict) or answer.get("ready") is not (status == 200):
+            raise APIError("GET", path, status, f"not core's readiness answer: {body}")
+        try:
+            retry_after = max(0.0, float(headers.get("Retry-After", "1")))
+        except ValueError:
+            retry_after = 1.0
+        return answer["ready"], answer.get("phase", ""), retry_after
 
     # ── Permissions ────────────────────────────────────────────
 
@@ -444,8 +517,20 @@ class LocalitasClient:
         return resp["result"]
 
 
-_ANNOUNCE_RETRY_FIRST = 1.0
-_ANNOUNCE_RETRY_MAX = 30.0
+def _core_down(e: BaseException) -> bool:
+    """Whether e says core's process is not there: it refused the connection,
+    or dropped it without answering."""
+    if isinstance(e, URLError) and not isinstance(e, HTTPError):
+        e = e.reason if isinstance(e.reason, BaseException) else e
+    return isinstance(e, (ConnectionRefusedError, ConnectionResetError))
+
+
+def _not_ready(e: BaseException) -> bool:
+    """Whether a call failed because core could not take it yet: it answered
+    503 (not ready), or its process is not there."""
+    if isinstance(e, APIError):
+        return e.status_code == 503
+    return _core_down(e)
 
 
 def _in_container() -> bool:
@@ -462,11 +547,11 @@ class Announcement:
     """An app's registration with core, made by LocalitasClient.announce."""
 
     def __init__(self, client: LocalitasClient, port: int):
-        import threading
-
         self._client = client
         self._url = f"http://localhost:{port}"
         self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._registering = False
         self._name = ""
         self._thread = None
         if _in_container():
@@ -477,19 +562,36 @@ class Announcement:
     def _run(self) -> None:
         import logging
 
-        wait = _ANNOUNCE_RETRY_FIRST
-        while not self._stop.is_set():
+        log = logging.getLogger("localitas")
+        while True:
             try:
-                app = self._client._do("POST", "/apps/ext", {"url": self._url}) or {}
-                self._name = app.get("name", "")
-                logging.getLogger("localitas").info("announced %s at %s", self._name, self._url)
-                return
+                if not self._client.wait_ready(PHASE_READY, self._stop):
+                    return
             except (APIError, OSError, ValueError) as e:
-                logging.getLogger("localitas").warning(
-                    "core has not taken the app at %s yet; trying again in %.0fs: %s", self._url, wait, e)
-            if self._stop.wait(wait):
+                log.error("waiting for core to be ready failed; the app at %s is not announced: %s", self._url, e)
                 return
-            wait = min(2 * wait, _ANNOUNCE_RETRY_MAX)
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                self._registering = True
+            name, err = "", None
+            try:
+                name = (self._client._do("POST", "/apps/ext", {"url": self._url}) or {}).get("name", "")
+            except (APIError, OSError, ValueError) as e:
+                err = e
+            with self._lock:
+                self._registering = False
+                if err is None:
+                    self._name = name
+            if err is None:
+                log.info("announced %s at %s", name, self._url)
+                return
+            if self._stop.is_set():
+                return
+            if not _not_ready(err):
+                log.error("core refused the app at %s; it is not announced: %s", self._url, err)
+                return
+            log.info("core is not ready to take the app at %s; waiting for it: %s", self._url, err)
 
     @property
     def name(self) -> str:
@@ -499,9 +601,14 @@ class Announcement:
         return self._name
 
     def withdraw(self) -> None:
-        """Stop announcing and take the app out of core, if core had taken it."""
-        self._stop.set()
-        if self._thread is not None:
+        """Stop announcing and take the app out of core, if core had taken it.
+        A registration in flight is waited for, since core answers after
+        taking the app and only its answer names it; a wait for core's
+        readiness is left to end on its own, as it registers nothing."""
+        with self._lock:
+            self._stop.set()
+            registering = self._registering
+        if self._thread is not None and registering:
             self._thread.join()
         if self._name:
             self._client._do("DELETE", f"/apps/ext/{_esc(self._name)}")
