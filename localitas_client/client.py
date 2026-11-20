@@ -245,8 +245,10 @@ class LocalitasClient:
         background thread, waits until core is ready (wait_ready) and
         registers the app once, since core reads the app while registering
         it: call it before serving. A registration core answers 503 (not
-        ready: it restarted) waits again; any other failure is logged at
-        ERROR and not tried again. Call withdraw() on shutdown.
+        ready: it restarted) waits again; one it answers 502 (the app does
+        not answer yet) is asked again after a bounded backoff; any other
+        failure is logged at ERROR and not tried again. Call withdraw() on
+        shutdown.
 
         In a container it does nothing: core registers app containers itself
         when Docker reports them healthy, and only core knows the port it
@@ -525,6 +527,12 @@ def _core_down(e: BaseException) -> bool:
     return isinstance(e, (ConnectionRefusedError, ConnectionResetError))
 
 
+def _app_not_answering(e: BaseException) -> bool:
+    """Whether core could not take the app because the app did not answer it
+    yet (502): its port closed, or health.json not served yet."""
+    return isinstance(e, APIError) and e.status_code == 502
+
+
 def _not_ready(e: BaseException) -> bool:
     """Whether a call failed because core could not take it yet: it answered
     503 (not ready), or its process is not there."""
@@ -563,6 +571,7 @@ class Announcement:
         import logging
 
         log = logging.getLogger("localitas")
+        redial = _REDIAL_FIRST
         while True:
             try:
                 if not self._client.wait_ready(PHASE_READY, self._stop):
@@ -588,6 +597,15 @@ class Announcement:
                 return
             if self._stop.is_set():
                 return
+            if _app_not_answering(err):
+                # The app announces before it serves: nothing tells this
+                # thread when it starts answering, so core is asked again
+                # after a bounded backoff.
+                log.info("core cannot reach the app at %s yet; asking again in %.1fs: %s", self._url, redial, err)
+                if self._stop.wait(redial):
+                    return
+                redial = min(2 * redial, _REDIAL_MAX)
+                continue
             if not _not_ready(err):
                 log.error("core refused the app at %s; it is not announced: %s", self._url, err)
                 return

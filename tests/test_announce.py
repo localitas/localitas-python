@@ -67,7 +67,9 @@ class FakeCore:
             return 201, {"name": "app"}
         if status == 503:
             return 503, {"error": "node not ready: serving"}
-        return status, {"error": "health.json: connection refused"}
+        if status == 502:
+            return 502, {"error": "health.json: connection refused: the app does not answer health.json"}
+        return status, {"error": "health.json names no app"}
 
     def next(self) -> str:
         try:
@@ -123,8 +125,19 @@ class TestAnnounce(unittest.TestCase):
         self.assertEqual(announcement.name, "app")
         self.assertEqual((core.post_count(), core.ask_count()), (2, 2))
 
-    def test_refused_registration_is_not_retried(self):
+    def test_app_not_answering_yet_is_asked_again_then_registers_once(self):
         core = FakeCore(post_status=[502])
+        core.ready.set()
+        announcement = self.start(core)
+
+        self.assertEqual([core.next(), core.next(), core.next(), core.next()], ["ready", "post", "ready", "post"],
+                         "core found the app not answering yet (502) and the app did not register once it answered")
+        self.ended(announcement)
+        self.assertEqual(announcement.name, "app")
+        self.assertEqual(core.post_count(), 2)
+
+    def test_refused_registration_is_not_retried(self):
+        core = FakeCore(post_status=[422])
         core.ready.set()
         announcement = self.start(core)
 
