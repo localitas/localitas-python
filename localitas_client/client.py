@@ -33,6 +33,9 @@ PHASE_READY = "ready"
 # is not there yet: under core's shortest HTTP write timeout (30 s), which
 # would cut a longer one.
 _READY_POLL_TIMEOUT = 25
+# How long core holds one wait for a run before answering that it has not
+# finished, under the same write timeout.
+_RUN_WAIT_HOLD = 25
 _REDIAL_FIRST = 0.1
 _REDIAL_MAX = 5.0
 
@@ -489,7 +492,7 @@ class LocalitasClient:
 
     # ── Transport ──────────────────────────────────────────────
 
-    def _do(self, method: str, path: str, body: Any = None) -> Any:
+    def _do(self, method: str, path: str, body: Any = None, timeout: float = 30) -> Any:
         url = self._url(path)
         data = None
         if body is not None:
@@ -503,7 +506,7 @@ class LocalitasClient:
             req.add_header("Content-Type", "application/json")
 
         try:
-            with urlopen(req, timeout=30) as resp:
+            with urlopen(req, timeout=timeout) as resp:
                 resp_body = resp.read().decode()
                 if resp_body:
                     return json.loads(resp_body)
@@ -1402,46 +1405,40 @@ class AutomationClient:
     def wait_for_run(self, run_id: str, timeout: float = 3600) -> dict:
         """Return the run once it has finished, without polling it.
 
-        Every finished run is announced once, after its outcome is recorded,
-        on the channel its first read names (its owner's own completions
-        channel; only the owner can read the run, so the caller is the
-        owner), or on the shared "completions" channel of a core that names
-        none. This reads the run to learn the channel, notes the channel's
-        last message, then reads the run again; the read is linearizable, so
-        a run whose completion is at or before the noted message is read
-        finished. A run still going is waited for by watching the channel
-        after the noted message: its completion comes after it, so it cannot
-        be missed.
+        Asks core's wait for the run, a long poll any node answers from the
+        committed run: at once when the run has finished, else as soon as a
+        commit ends it, or after core's hold that it has not, when it asks
+        again. It depends on nothing being published: a node that records
+        the run's end and dies before telling anyone still leaves the end
+        committed. A core that cannot answer yet (503, or its process not
+        there) is waited for (wait_ready) and asked again. A run that does
+        not exist, or is not the caller's, raises core's APIError; the wait
+        raises TimeoutError after timeout seconds.
         """
-        import threading
-
-        run = self.get_run(run_id)
-        if run.get("status") in ("completed", "failed"):
-            return run
-        channel = run.get("completion_channel") or "completions"
-        noted = self._client.cache("localitas_automations").pubsub(channel).last_seq()
-        run = self.get_run(run_id)
-        if run.get("status") in ("completed", "failed"):
-            return run
-
-        ws_url = websocket_url(self._client.base_url, "/apps/cache/ws/localitas_automations")
-        finished = threading.Event()
-
-        def on_msg(msg):
-            try:
-                if json.loads(msg.get("value") or "{}").get("run_id") == run_id:
-                    finished.set()
-            except (ValueError, AttributeError):
-                pass
-
-        ps = PubSubWS(ws_url, self._client._bearer())
-        try:
-            ps.watch(channel, noted, on_msg)
-            if not finished.wait(timeout=timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise TimeoutError(f"Timeout waiting for run {run_id}")
-            return self.get_run(run_id)
-        finally:
-            ps.close()
+            hold = min(_RUN_WAIT_HOLD, remaining)
+            query = urllib.parse.urlencode({"timeout": f"{hold:.3f}s"})
+            try:
+                answer = self._client._do("GET", f"/apps/automation/api/runs/{_esc(run_id)}/wait?{query}",
+                                          timeout=hold + 30)
+            except (APIError, OSError) as e:
+                if not _not_ready(e):
+                    raise
+                stop = threading.Event()
+                timer = threading.Timer(remaining, stop.set)
+                timer.start()
+                try:
+                    if not self._client.wait_ready(stop=stop):
+                        raise TimeoutError(f"Timeout waiting for run {run_id}") from None
+                finally:
+                    timer.cancel()
+                continue
+            if answer.get("finished"):
+                return answer["run"]
 
 
 class PubSubWS:
