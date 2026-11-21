@@ -19,7 +19,7 @@ def slow_automation(client, name):
     """A manual automation whose only call fails slowly: retried with 30 s
     backoff, it runs for minutes unless its outcome is published."""
     settings = {
-        "url": f"{INTEG_URL}/api/system/no_such_route_{name}",
+        "url": f"/api/system/no_such_route_{name}",
         "method": "GET",
         "timeout_ms": 5000,
         "max_retries": 3,

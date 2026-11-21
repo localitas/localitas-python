@@ -18,6 +18,9 @@ ALLOWED = {
     # An app announces its own listener on this host to core: the app's
     # address, not a guess at where core is.
     ("client.py", 'self._url = f"http://localhost:{port}"'),
+    # The names an automation's url may not hold, refused before sending
+    # (_own_machine): never called.
+    ("automation.py", '_OWN_NAMES = ("localhost", "host.docker.internal")'),
 }
 
 
