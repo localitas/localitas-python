@@ -79,9 +79,10 @@ _OWN_NAMES = ("localhost", "host.docker.internal")
 
 def _own_machine(host: str) -> bool:
     """Whether host only ever means the machine using it: a loopback,
-    unspecified or link-local address, its own name, or a container's host."""
-    host = host.lower()
-    if host in _OWN_NAMES:
+    unspecified or link-local address, its own name or any name under it
+    (RFC 6761), or a container's host."""
+    host = host.lower().removesuffix(".")
+    if host in _OWN_NAMES or host.endswith(".localhost"):
         return True
     try:
         ip = ipaddress.ip_address(host)
