@@ -44,19 +44,64 @@ def _now() -> float:
     return time.time()
 
 
-_NO_CORE_URL = "CORE_URL is not set: core sets it for every app it runs; outside core pass the URL to the constructor"
-_NO_TOKEN = "LOCALITAS_API_TOKEN is not set: core sets it for every app it runs; outside core pass the token to the constructor"
+# How a process learns where core is and which token it acts with: core
+# gives an app it starts (a container, a FaaS function) CORE_URL and
+# LOCALITAS_API_TOKEN, and writes the same variables, with its loopback URL,
+# to core.env in its home for the other processes of its machine (an app
+# launchd runs, a tool). Each is read from the environment first, from the
+# home's file second; the Go and Node SDKs read them the same way.
+CORE_URL_VAR = "CORE_URL"
+TOKEN_VAR = "LOCALITAS_API_TOKEN"
+HOME_VAR = "LOCALITAS_HOME"
+CORE_ENV_FILE = "core.env"
+
+_NO_CORE_URL = (
+    "CORE_URL is not set: core sets it for every app it starts and writes it to core.env in its home "
+    "($LOCALITAS_HOME, else ~/.localitas) for the other processes of its machine; outside core pass the URL "
+    "to the constructor"
+)
+
+
+def core_home() -> str:
+    """The home of the core this process belongs to: $LOCALITAS_HOME, else
+    ~/.localitas."""
+    return os.environ.get(HOME_VAR) or str(Path.home() / ".localitas")
+
+
+def _core_settings() -> tuple[str, str, str, str]:
+    """(url, token, where the URL came from, the home's core.env path): each
+    variable from the environment when set, else from the home's core.env."""
+    url = os.environ.get(CORE_URL_VAR, "").strip()
+    token = os.environ.get(TOKEN_VAR, "").strip()
+    path = os.path.join(core_home(), CORE_ENV_FILE)
+    source = "environment"
+    if not url or not token:
+        try:
+            lines = Path(path).read_text().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = (part.strip() for part in line.split("=", 1))
+            if key == CORE_URL_VAR and not url:
+                url, source = value, path
+            elif key == TOKEN_VAR and not token:
+                token = value
+    return url, token, source, path
 
 
 def core_url_from_env() -> str:
-    """Core's base URL from CORE_URL, which core sets for every app it runs.
-    Raises ConfigError when it is unset or not an absolute http(s) URL."""
-    url = os.environ.get("CORE_URL", "").strip()
+    """Core's base URL: CORE_URL, else the one in the home's core.env.
+    Raises ConfigError, naming the variable and the file, when there is none
+    or it is not an absolute http(s) URL."""
+    url, _, source, path = _core_settings()
     if not url:
-        raise ConfigError(_NO_CORE_URL)
+        raise ConfigError(f"{_NO_CORE_URL} ({path} has none)")
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise ConfigError(f"CORE_URL {url!r} is not an absolute http(s) URL")
+        raise ConfigError(f"CORE_URL {url!r} (from the {source}) is not an absolute http(s) URL")
     return url.rstrip("/")
 
 
@@ -74,20 +119,9 @@ def websocket_url(base_url: str, path: str) -> str:
 
 
 def default_token() -> str:
-    """Deprecated: use LocalitasClient.default(). The API token from
-    LOCALITAS_API_TOKEN, else from ~/.localitas/config-core.yaml
-    (core.auth.api_token); empty string if neither has one."""
-    if os.environ.get("LOCALITAS_API_TOKEN"):
-        return os.environ["LOCALITAS_API_TOKEN"]
-    config_path = Path.home() / ".localitas" / "config-core.yaml"
-    if config_path.exists():
-        for line in config_path.read_text().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("api_token:"):
-                val = stripped.removeprefix("api_token:").strip().strip("\"'")
-                if val.startswith("lt_"):
-                    return val
-    return ""
+    """The API token LocalitasClient.default() uses: LOCALITAS_API_TOKEN,
+    else the one in the home's core.env; empty string if neither has one."""
+    return _core_settings()[1]
 
 
 class ConfigError(Exception):
@@ -117,13 +151,18 @@ class LocalitasClient:
 
     @classmethod
     def default(cls) -> "LocalitasClient":
-        """The client of an app core runs: core's URL from CORE_URL and the
-        app's token from LOCALITAS_API_TOKEN, both set by core. Raises
-        ConfigError naming the variable that is missing or malformed."""
+        """The client of an app: core's URL (CORE_URL) and the app's token
+        (LOCALITAS_API_TOKEN), each from the environment core gives an app it
+        starts, else from the core.env core writes in its home for the other
+        processes of its machine. Raises ConfigError naming the variable and
+        the file when one is missing or malformed."""
         url = core_url_from_env()
-        token = os.environ.get("LOCALITAS_API_TOKEN", "")
+        _, token, _, path = _core_settings()
         if not token:
-            raise ConfigError(_NO_TOKEN)
+            raise ConfigError(
+                f"LOCALITAS_API_TOKEN is not set: core sets it for every app it starts and writes it to {path} "
+                "for the other processes of its machine; outside core pass the token to the constructor"
+            )
         return cls(url, token)
 
     def with_token(self, token: str) -> "LocalitasClient":

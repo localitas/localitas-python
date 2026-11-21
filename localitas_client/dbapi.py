@@ -38,7 +38,7 @@ def _is_read_query(sql: str) -> bool:
 
 def connect(database: str, host: str = "", token: str = "") -> "Connection":
     """Connect to a database by ID through core at ``host``, or else at
-    CORE_URL. Prefer ``LocalitasClient.default().db(name)``."""
+    CORE_URL (or the home's core.env). Prefer ``LocalitasClient.default().db(name)``."""
     if host:
         base_url = host if host.startswith("http") else f"http://{host}"
     else:
