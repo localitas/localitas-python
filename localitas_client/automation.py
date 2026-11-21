@@ -14,9 +14,11 @@ Example::
     LocalitasClient.default().automation().create(req)
 """
 
+import ipaddress
 import re
 from dataclasses import dataclass
 from typing import Any, Optional, Union
+from urllib.parse import urlsplit
 
 from .client import _check_app_name, _check_app_path
 
@@ -72,6 +74,50 @@ def _set(out: dict, **fields: Any) -> dict:
     return out
 
 
+_OWN_NAMES = ("localhost", "host.docker.internal")
+
+
+def _own_machine(host: str) -> bool:
+    """Whether host only ever means the machine using it: a loopback,
+    unspecified or link-local address, its own name or any name under it
+    (RFC 6761), or a container's host."""
+    host = host.lower().removesuffix(".")
+    if host in _OWN_NAMES or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_loopback or ip.is_unspecified or ip.is_link_local
+
+
+def _check_call_url(raw: str) -> None:
+    """Accepts what core does in an http-api task's url: a core path
+    ("/apps/..."), called on the node running the step, or an absolute http(s)
+    URL of another machine. A URL naming the machine using it (loopback, its
+    own name) is refused: stored in a replicated automation, it sends whichever
+    node runs the step to itself. An app is called by name, an AppCall. A url
+    still holding a template ({{node.field}}) in place of its scheme or host is
+    checked by core once it is filled in."""
+    if raw.startswith("/") and not raw.startswith("//"):
+        return
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname
+    except ValueError:
+        parts, host = None, None
+    if parts is None or parts.scheme not in ("http", "https") or not host:
+        if "{{" in raw:
+            return
+        raise ValueError(f"url {raw!r} is neither a path (/apps/...) nor an http(s) URL")
+    if _own_machine(host):
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        raise ValueError(
+            f"url {raw!r} names this machine's own address, which sends whichever node runs the step to itself; "
+            f"call an app by name with an AppCall (core's AppRef: app, path {path}, protocol http), "
+            f"or core by its path ({path})")
+
+
 @dataclass
 class AppCall:
     """An app's endpoint by name, called through core."""
@@ -113,6 +159,8 @@ class HTTPSettings:
     def __post_init__(self):
         if bool(self.url) == (self.app is not None):
             raise ValueError("an http-api task calls exactly one of url or app")
+        if self.url:
+            _check_call_url(self.url)
         if self.app is not None:
             if not isinstance(self.app, AppCall):
                 raise TypeError(f"app must be an AppCall, got {self.app!r}")

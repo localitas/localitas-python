@@ -123,6 +123,22 @@ class TestValidation(unittest.TestCase):
             with self.subTest(name), self.assertRaises((ValueError, TypeError)):
                 build()
 
+    def test_refuses_a_url_naming_this_machine_for_an_app_call(self):
+        # Core refuses each: stored in a replicated automation, it sends
+        # whichever node runs the step to itself.
+        for raw in ("http://localhost:9204/api/sync", "http://LOCALHOST:8090/apps/faas/fn/report",
+                    "http://127.0.0.2:9204/api/sync", "http://[::1]:8090/apps/notes/api/notes",
+                    "http://0.0.0.0:9204/api/sync", "http://localhost.:8090/apps/faas/fn/report",
+                    "http://notes.localhost:8090/apps/notes/api/notes"):
+            with self.subTest(raw), self.assertRaisesRegex(ValueError, "AppCall.*AppRef"):
+                HTTPSettings(url=raw)
+        with self.assertRaises(ValueError):
+            HTTPSettings(url="ftp://a.test/b")
+        for raw in ("/apps/faas/fn/report", "https://hooks.example.com/done", "http://192.168.1.50:8080/hook",
+                    "{{lookup.response.url}}"):
+            with self.subTest(raw):
+                self.assertEqual(HTTPSettings(url=raw).to_dict(), {"url": raw})
+
     def test_accepts_go_durations(self):
         for d in ("30s", "5m", "1h30m", "1.5h", "300ms", "10us", "10µs", "2ns"):
             with self.subTest(d):
