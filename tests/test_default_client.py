@@ -21,6 +21,7 @@ ALLOWED = {
     # The names an automation's url may not hold, refused before sending
     # (_own_machine): never called.
     ("automation.py", '_OWN_NAMES = ("localhost", "host.docker.internal")'),
+    ("automation.py", 'if host in _OWN_NAMES or host.endswith(".localhost"):'),
 }
 
 

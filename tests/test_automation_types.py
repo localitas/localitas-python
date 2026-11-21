@@ -128,7 +128,8 @@ class TestValidation(unittest.TestCase):
         # whichever node runs the step to itself.
         for raw in ("http://localhost:9204/api/sync", "http://LOCALHOST:8090/apps/faas/fn/report",
                     "http://127.0.0.2:9204/api/sync", "http://[::1]:8090/apps/notes/api/notes",
-                    "http://0.0.0.0:9204/api/sync"):
+                    "http://0.0.0.0:9204/api/sync", "http://localhost.:8090/apps/faas/fn/report",
+                    "http://notes.localhost:8090/apps/notes/api/notes"):
             with self.subTest(raw), self.assertRaisesRegex(ValueError, "AppCall.*AppRef"):
                 HTTPSettings(url=raw)
         with self.assertRaises(ValueError):
