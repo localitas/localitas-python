@@ -1398,22 +1398,24 @@ class AutomationClient:
         """Get a run by ID."""
         return self._client._do("GET", f"/apps/automation/api/runs/{run_id}")
 
-    def publish_result(self, run_id: str, status: str = "completed", result: dict = None, error: str = "",
+    def publish_result(self, run_id: str, status: str = "completed", result: Any = None, error: str = "",
                        idempotency_key: str = ""):
         """Signal async job completion. Called from inside the background job.
-        ``idempotency_key`` (the call's Idempotency-Key header) restricts the
-        completion to the try that call was."""
-        payload = {"status": status, "result": result or {}, "error": error}
+        ``result`` is any JSON value (dict, list, str, number). ``idempotency_key``
+        (the call's Idempotency-Key header) restricts the completion to the try
+        that call was."""
+        payload = {"status": status, "result": {} if result is None else result, "error": error}
         if idempotency_key:
             payload["idempotency_key"] = idempotency_key
         return self._client._do("POST", f"/apps/automation/api/runs/{_esc(run_id)}/complete", payload)
 
     def run_async(self, run_id_or_request, work) -> bool:
         """Run ``work`` in a background thread and publish its result back to the
-        automation run when done. ``work`` is a zero-arg callable returning a
-        dict (or None). Returns True if the call belongs to a run (so the
-        handler should respond 202 immediately), False otherwise — mirroring
-        the Go RunAsync fire-and-202 pattern.
+        automation run when done. ``work`` is a zero-arg callable returning any
+        JSON value (dict, list, str, number) or None; core times the run itself.
+        Returns True if the call belongs to a run (so the handler should respond
+        202 immediately), False otherwise — mirroring the Go RunAsync
+        fire-and-202 pattern.
 
         Pass the incoming request (anything with ``.headers``) or its headers
         (any mapping; names match case-insensitively): the run comes from
@@ -1427,15 +1429,11 @@ class AutomationClient:
         import threading
 
         def _run():
-            start = time.time()
             status, error, result = "completed", "", None
             try:
                 result = work()
             except Exception as exc:  # noqa: BLE001 - report failure to the run
                 status, error = "failed", str(exc)
-            if result is None:
-                result = {}
-            result["duration_ms"] = int((time.time() - start) * 1000)
             self.publish_result(run_id, status, result, error, idempotency_key=key)
 
         threading.Thread(target=_run, daemon=True).start()

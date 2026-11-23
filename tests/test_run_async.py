@@ -63,6 +63,14 @@ class TestRunAsync(unittest.TestCase):
         self.assertFalse(self.automation.run_async("", lambda: None))
         self.assertTrue(self.core.calls.empty())
 
+    def test_publishes_a_list_result(self):
+        self.assertTrue(self.automation.run_async("r1", lambda: ["inbox", "sent"]))
+        self.assertEqual(self.completion(), {"status": "completed", "result": ["inbox", "sent"], "error": ""})
+
+    def test_publish_result_keeps_an_empty_list(self):
+        self.automation.publish_result("r1", "completed", [], "")
+        self.assertEqual(self.completion(), {"status": "completed", "result": [], "error": ""})
+
     def test_publish_result_sends_the_key_when_given(self):
         self.automation.publish_result("r1", "failed", None, "boom", idempotency_key="r1/fetch/1")
         self.assertEqual(self.completion(), {"status": "failed", "result": {}, "error": "boom",
